@@ -1,1 +1,2 @@
-source venv/Scripts/activate
+source .venv/Scripts/activate
+python src/core/input_manager.py

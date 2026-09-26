@@ -1,7 +1,12 @@
+"""
+src/core/vision/vision_manager.py
+"""
+
 import os
 import sys
 import time
 import logging
+from dataclasses import dataclass
 
 import cv2
 import mss
@@ -13,6 +18,20 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 from src.config import vision_config
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TargetInfo:
+    """
+    Результат ОДНОГО скана экрана за тик. dataclass, а не кортеж —
+    именованные поля вместо result[0]/result[1]/..., меньше риска
+    перепутать порядок при чтении в FSM, и repr сразу показывает
+    имена полей при отладке в логах — не нужно помнить, что где лежит.
+    """
+    found: bool
+    hp_percent: float
+    offset_x: float  # смещение центра HP-бара от центра ROI, px. + = бар правее центра ROI.
+    offset_y: float  # + = бар ниже центра ROI.
 
 
 class VisionManager:
@@ -27,6 +46,16 @@ class VisionManager:
         Конкретные координаты ROI (Region of Interest — зона захвата) передаются
         в каждый метод отдельно. Это позволяет одним объектом VisionManager
         читать HP таргета, HP персонажа и MP без пересоздания захвата.
+
+        get_target_info() — ЕДИНСТВЕННАЯ точка входа для FSM за один тик:
+        один захват кадра (mss.grab), один проход детекции, из которого
+        разом получаются found/hp_percent/offset_x/offset_y. Раньше
+        has_target()/get_hp_percent() были раздельными обёртками, каждая
+        со своим захватом кадра — вызвать оба за тик значило бы захватывать
+        экран дважды, лишняя нагрузка на 60 FPS цикл. Поэтому оба метода
+        удалены, а не оставлены рядом с новым — одна дорога вместо двух
+        означает, что случайно наступить на грабли двойного захвата
+        попросту негде.
     """
 
     def __init__(self) -> None:
@@ -47,12 +76,13 @@ class VisionManager:
         self._red_upper_1 = np.array(vision_config.RED_UPPER_1, dtype=np.uint8)
         self._red_lower_2 = np.array(vision_config.RED_LOWER_2, dtype=np.uint8)
         self._red_upper_2 = np.array(vision_config.RED_UPPER_2, dtype=np.uint8)
-        
+
         # Добавляем желтый цвет
         self._yellow_lower = np.array(vision_config.YELLOW_LOWER, dtype=np.uint8)
         self._yellow_upper = np.array(vision_config.YELLOW_UPPER, dtype=np.uint8)
-        
+
         self._max_hp_width = float(vision_config.MAX_TARGET_HP_WIDTH)
+
         logger.debug("VisionManager: HSV-конфиг загружен.")
 
     def build_roi(self, offset_x: int, offset_y: int,
@@ -64,36 +94,44 @@ class VisionManager:
             "height": height,
         }
 
-    def get_target_state(self, roi_coords: dict) -> tuple[bool, float]:
+    def get_target_info(self, roi_coords: dict) -> TargetInfo:
         """
-        Главный метод для FSM. Один захват экрана — два значения.
-        Returns:
-            tuple[bool, float]: (есть ли таргет, процент HP от 0.0 до 100.0)
+        Главный метод для FSM. Один захват экрана — сразу все данные,
+        нужные и для боевой логики (found, hp_percent), и для доворота
+        камеры (offset_x, offset_y).
         """
+        empty = TargetInfo(found=False, hp_percent=0.0, offset_x=0.0, offset_y=0.0)
+
         frame = self._capture(roi_coords)
         if frame is None:
-            return False, 0.0
+            return empty
 
         bar = self._find_hp_bar(frame)
         if bar is None:
-            return False, 0.0
+            return empty
 
-        _, _, bar_width, _ = bar
+        bar_x, bar_y, bar_w, bar_h = bar
 
-        hp = min((bar_width / self._max_hp_width) * 100.0, 100.0)
+        hp = min((bar_w / self._max_hp_width) * 100.0, 100.0)
         hp = round(hp, 2)
 
-        return True, hp
+        # Центр найденного бара В КАДРЕ (координаты внутри самого ROI,
+        # а не всего экрана — frame это уже вырезанный кусок по roi_coords).
+        bar_center_x = bar_x + bar_w / 2
+        bar_center_y = bar_y + bar_h / 2
 
-    def has_target(self, roi_coords: dict) -> bool:
-        """Тонкая обёртка над get_target_state."""
-        has, _ = self.get_target_state(roi_coords)
-        return has
+        # Центр САМОГО ROI (не центр экрана!) — насколько бар отклонился
+        # от точки, где мы ОЖИДАЛИ его увидеть. ROI сам смещён от центра
+        # экрана офсетами из конфига (HP-бар обычно не строго в центре
+        # экрана), но для доворота камеры важна разница именно от центра
+        # ROI — это и есть "насколько цель уехала от привычного места".
+        roi_center_x = roi_coords["width"] / 2
+        roi_center_y = roi_coords["height"] / 2
 
-    def get_hp_percent(self, roi_coords: dict) -> float:
-        """Тонкая обёртка над get_target_state."""
-        _, hp = self.get_target_state(roi_coords)
-        return hp
+        offset_x = bar_center_x - roi_center_x
+        offset_y = bar_center_y - roi_center_y
+
+        return TargetInfo(found=True, hp_percent=hp, offset_x=offset_x, offset_y=offset_y)
 
     def _find_hp_bar(self, frame: "np.ndarray") -> "tuple[int,int,int,int] | None":
         """
@@ -128,7 +166,7 @@ class VisionManager:
 
             # Фильтр 2: Плотность (Extent) — САМЫЙ ВАЖНЫЙ!
             # Настоящая полоска ХП — это сплошной прямоугольник (плотность близка к 1.0).
-            # Декоративная линия с "галочкой" образует высокую рамку (h), но внутри неё 
+            # Декоративная линия с "галочкой" образует высокую рамку (h), но внутри неё
             # почти нет желтых пикселей (много пустоты). Её плотность будет < 0.3.
             extent = area / (w * h)
             if extent < 0.5:
@@ -174,9 +212,12 @@ if __name__ == "__main__":
 
     try:
         while True:
-            has_target, hp = vision.get_target_state(TEST_ROI)
+            info = vision.get_target_info(TEST_ROI)
 
-            status = f"HP: {hp:.1f}%" if has_target else "Таргет не найден"
+            status = (
+                f"HP: {info.hp_percent:.1f}% | offset=({info.offset_x:+.0f}, {info.offset_y:+.0f})px"
+                if info.found else "Таргет не найден"
+            )
             print(status)
 
             frame = vision._capture(TEST_ROI)
@@ -187,7 +228,15 @@ if __name__ == "__main__":
                     interpolation=cv2.INTER_NEAREST,
                 )
 
-                if has_target:
+                # Центр ROI — опорная точка, от которой считается offset.
+                # Рисуем крестом, чтобы визуально видеть, куда "должен"
+                # попадать бар, и насколько он от этой точки уехал.
+                roi_cx = TEST_ROI["width"] * 4 // 2
+                roi_cy = TEST_ROI["height"] * 4 // 2
+                cv2.drawMarker(debug_frame, (roi_cx, roi_cy), (255, 0, 0),
+                                markerType=cv2.MARKER_CROSS, markerSize=20, thickness=2)
+
+                if info.found:
                     bar = vision._find_hp_bar(frame)
                     if bar is not None:
                         x, y, w, h = bar
@@ -198,6 +247,11 @@ if __name__ == "__main__":
                             (0, 255, 0),
                             2,
                         )
+                        # Линия от центра ROI к центру бара — наглядно
+                        # показывает direction/magnitude offset_x/offset_y.
+                        bar_cx = (x + w // 2) * 4
+                        bar_cy = (y + h // 2) * 4
+                        cv2.line(debug_frame, (roi_cx, roi_cy), (bar_cx, bar_cy), (0, 255, 255), 2)
 
                 cv2.imshow("VisionManager Debug", debug_frame)
 
