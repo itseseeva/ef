@@ -23,6 +23,7 @@ Operational дважды проверялся и не содержал ни од
 подтвердилась.
 """
 
+import os
 import time
 import random
 import logging
@@ -32,6 +33,30 @@ import queue
 import vgamepad as vg
 
 logger = logging.getLogger(__name__)
+
+# ВРЕМЕННЫЙ отладочный лог-файл: пишет КАЖДОЕ реальное нажатие/отпускание
+# кнопки или курка геймпада с таймстампом до миллисекунды — нужно, чтобы
+# разобраться, почему конкретная связка (например RB+Y) не срабатывает
+# в игре, хотя код для неё идентичен рабочим связкам. Отдельный логгер
+# (не common `logger` выше), потому что:
+#   1) propagate = False — не льётся в общий консольный INFO-лог, который
+#      и так не рассчитан на построчный вывод каждого нажатия;
+#   2) свой FileHandler с mode="w" — файл перезаписывается при каждом
+#      запуске приложения, чтобы там всегда лежал только САМЫЙ СВЕЖИЙ
+#      прогон, а не мешанина из старых сессий.
+# Лежит в корне проекта (на уровень выше src/core) — рядом с app_launcher.py,
+# там, где пользователь его точно найдёт, не заходя в подпапки.
+_GAMEPAD_LOG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "gamepad_debug.log"
+)
+gamepad_debug_logger = logging.getLogger("gamepad_debug")
+gamepad_debug_logger.setLevel(logging.DEBUG)
+gamepad_debug_logger.propagate = False
+_gamepad_log_handler = logging.FileHandler(_GAMEPAD_LOG_PATH, mode="w", encoding="utf-8")
+_gamepad_log_handler.setFormatter(
+    logging.Formatter("%(asctime)s.%(msecs)03d  %(message)s", datefmt="%H:%M:%S")
+)
+gamepad_debug_logger.addHandler(_gamepad_log_handler)
 
 
 def _smoothstep(t: float) -> float:
@@ -164,6 +189,59 @@ class InputManager:
     # а не только маскировка под человека.
     _COMBO_STEP_DELAY_S = (0.03, 0.07)
 
+    # Пауза МЕЖДУ ОТДЕЛЬНЫМИ СКИЛЛАМИ в цепочке — то есть после того, как
+    # execute_combo() для одного скилла полностью отработал (см. _worker),
+    # перед тем как воркер возьмёт из очереди следующий скилл. Это ДРУГОЙ,
+    # более крупный масштаб паузы, чем _COMBO_STEP_DELAY_S выше (та — между
+    # hold/press/release ВНУТРИ одного скилла).
+    #
+    # Два непересекающихся диапазона, а не один сплошной интервал: реальный
+    # игрок жмёт следующий скилл ротации не по равномерному закону — либо
+    # почти сразу (заученная связка), либо с заметной задержкой (смотрит на
+    # экран/решает). Смесь из двух узких диапазонов даёт двугорбое
+    # распределение вместо плоского — статистически ближе к человеку и
+    # труднее для анти-чит анализа ритма, чем один uniform(min, max).
+    #
+    # Подняты с (0.3-0.5 / 0.5-0.7) до (0.88-0.98 / 1.2-1.6) — на практике
+    # скиллы стреляли быстрее, чем реально успевала доиграть анимация
+    # каста в игре: следующее нажатие прилетало ПОВЕРХ ещё не долетевшего
+    # предыдущего. Это уже не только анти-детект-маскировка, но и чисто
+    # игровое требование к темпу — тот же принцип, что и у
+    # _COMBO_STEP_DELAY_S внутри одного скилла, только на масштабе целой
+    # цепочки.
+    _SKILL_CAST_GAP_BANDS_S = ((0.88, 0.98), (1.2, 1.6))
+
+    # Пауза "прогрева" виртуального устройства СРАЗУ после его создания —
+    # см. докстринг __init__ ниже про warm-up update(). Один холостой
+    # update() шлётся в ТОТ ЖЕ программный тик, что и сам vg.VX360Gamepad() —
+    # а реальное распознавание НОВОГО XInput-устройства Windows/игрой
+    # физически занимает какое-то время (драйвер ViGEmBus регистрирует
+    # устройство, игра переопрашивает список джойстиков). Без этой паузы
+    # самая первая команда (press_button/execute_combo) стабильно
+    # прилетает РАНЬШЕ, чем устройство готово, и теряется — не через раз,
+    # а каждый раз, потому что тайминг гонки один и тот же при каждом
+    # создании InputManager.
+    #
+    # ВРЕМЕННО увеличено до 2.0с (вместо рабочих ~0.3с) — по просьбе, чтобы
+    # глазами чётко видеть паузу прогрева отдельно от начала самого
+    # прогона скиллов при тестах через F6. Как только первый скилл
+    # стабильно перестанет теряться — вернуть обратно к небольшому
+    # значению (0.3-0.5с с запасом), 2 секунды на каждое создание
+    # InputManager (то есть на каждый F6 и один раз при "Старт") —
+    # это заметная бесполезная задержка для обычного использования.
+    _GAMEPAD_SETTLE_S = 2.0
+
+    # ВРЕМЕННО (для диагностики F6-крэша): фиксированная пауза 2.0с ВМЕСТО
+    # _SKILL_CAST_GAP_BANDS_S выше. Жертвуем анти-детект-реализмом (двугорбое
+    # распределение выше значительно лучше для маскировки под человека) ради
+    # возможности глазами увидеть на медленном темпе, какой именно скилл из
+    # цепочки срабатывает последним перед крэшем и был ли разрыв в 500мс
+    # между 3 успевшими скиллами или они шли подряд. Сама _SKILL_CAST_GAP_BANDS_S
+    # НЕ удалена и не тронута — как только тест закончится, просто убери
+    # флаг ниже (или сам блок _DEBUG_FLAT_GAP_S), и код вернётся к боевому
+    # двугорбому распределению без дополнительных правок.
+    _DEBUG_FLAT_GAP_S: float | None = None
+
     def __init__(self) -> None:
         self._gamepad = vg.VX360Gamepad()
 
@@ -178,6 +256,13 @@ class InputManager:
         # после него уже летит на устройство, которое система "видела"
         # хотя бы раз.
         self._gamepad.update()
+
+        # Даём Windows/игре физически "увидеть" новое устройство ДО того,
+        # как в очередь ляжет первая настоящая команда — см. докстринг
+        # _GAMEPAD_SETTLE_S выше. Это блокирующий sleep, но он ОДИН раз за
+        # всю жизнь InputManager (при создании), а не в 60 FPS цикле FSM —
+        # цена оправдана тем, что чинит стабильную потерю первого скилла.
+        time.sleep(self._GAMEPAD_SETTLE_S)
 
         self._queue: "queue.Queue[tuple]" = queue.Queue()
         self._running = True
@@ -213,7 +298,7 @@ class InputManager:
         """
         self._queue.put(("aim_with_stick", dx, dy))
 
-    def execute_combo(self, actions: list[str]) -> None:
+    def execute_combo(self, actions: list[str], cast_time_s: float | None = None) -> None:
         """
         Ставит в очередь ЦЕЛУЮ комбинацию как ОДНУ задачу для воркера —
         например ['hold_LT', 'press_X', 'release_LT']. Формат строки:
@@ -229,8 +314,16 @@ class InputManager:
         коррекции прицела — и сломать тайминг модификатор+кнопка.
         Упаковав всю комбинацию в один элемент очереди, мы гарантируем,
         что она выполнится ПОДРЯД, без чужого вмешательства между шагами.
+
+        cast_time_s — необязательное РЕАЛЬНОЕ время каста ЭТОГО скилла в
+        игре (секунды). Если задано, пауза ПОСЛЕ этого скилла (перед тем
+        как воркер возьмётся за следующую задачу в очереди) считается от
+        него (±10% джиттер), а не от обычной короткой межскилльной паузы
+        (_SKILL_CAST_GAP_BANDS_S) — см. _worker(). Нужен для скиллов с
+        долгой анимацией/каналом (например 5 сек), где следующий скилл,
+        нажатый слишком рано, срывает ещё не долетевший каст.
         """
-        self._queue.put(("execute_combo", list(actions)))
+        self._queue.put(("execute_combo", list(actions), cast_time_s))
 
     @staticmethod
     def parse_combo_string(spec: str) -> list[str]:
@@ -312,6 +405,36 @@ class InputManager:
         self._gamepad.update()
         logger.debug("InputManager остановлен штатно.")
 
+    def wait_idle(self) -> None:
+        """
+        Дожидается, пока очередь опустеет — В ОТЛИЧИЕ от stop(), НЕ гасит
+        воркер-поток и НЕ трогает состояние геймпада. Нужен там, где один и
+        тот же InputManager (и, соответственно, одно и то же виртуальное
+        устройство) должен пережить несколько последовательных прогонов —
+        сейчас это тестовый F6 (см. Api.test_rotation), чтобы проверить
+        гипотезу "теряется первый инпут именно с НОВОГО устройства" — со
+        stop() тут не подходит: он убивает воркер насовсем, и следующий
+        вызов уже не смог бы поставить в очередь ни одной команды.
+        """
+        self._queue.join()
+
+    def is_idle(self) -> bool:
+        """
+        Неблокирующая проверка: True, только если очередь ПОЛНОСТЬЮ
+        свободна — ни одна команда не ждёт своей очереди И ни одна не
+        выполняется воркером ПРЯМО СЕЙЧАС.
+
+        ВАЖНО: это НЕ queue.empty() — тот вернул бы True, даже пока
+        воркер ещё держит последнюю команду в обработке (get() уже забрал
+        её из очереди, а task_done() ещё не вызван — то есть сам каст
+        комбо ещё физически играется). unfinished_tasks — тот же счётчик,
+        на который опирается queue.join()/wait_idle() (растёт на put(),
+        падает на task_done()) — то же самое условие готовности, просто
+        БЕЗ блокировки, чтобы можно было безопасно звать это прямо внутри
+        60 FPS цикла FSM (bot.py), не рискуя застрять на time.sleep().
+        """
+        return self._queue.unfinished_tasks == 0
+
     # ================= Внутреннее =================
 
     def _interruptible_sleep(self, seconds: float) -> bool:
@@ -326,19 +449,78 @@ class InputManager:
                 continue
 
             try:
-                if cmd[0] == "press_button":
-                    self._do_press_button(cmd[1])
-                elif cmd[0] == "aim_with_stick":
-                    self._do_aim_with_stick(cmd[1], cmd[2])
-                elif cmd[0] == "execute_combo":
-                    self._do_execute_combo(cmd[1])
-            except Exception as e:
-                logger.error("InputManager: ошибка выполнения команды: %s", e)
-            finally:
-                self._queue.task_done()
+                try:
+                    if cmd[0] == "press_button":
+                        self._do_press_button(cmd[1])
+                    elif cmd[0] == "aim_with_stick":
+                        self._do_aim_with_stick(cmd[1], cmd[2])
+                    elif cmd[0] == "execute_combo":
+                        self._do_execute_combo(cmd[1])
+                except Exception as e:
+                    logger.error("InputManager: ошибка выполнения команды: %s", e)
 
-            # Пауза между командами — тоже прерываемая, как и раньше.
-            self._interruptible_sleep(random.uniform(0.02, 0.05))
+                # ВАЖНО: пауза ПОСЛЕ физического нажатия — но ВСЁ ЕЩЁ ДО
+                # task_done() ниже (см. finally). Раньше task_done()
+                # вызывался сразу после нажатия, а эта пауза шла уже после
+                # него — из-за этого is_idle()/wait_idle() (оба держатся на
+                # том же счётчике unfinished_tasks, на который опирается
+                # task_done()) считали очередь СВОБОДНОЙ ещё до того, как
+                # пауза реально прошла. Для короткой паузы (0.3-1.6с) это
+                # было не критично, но для скилла с cast_time_s=5 (долгий
+                # каст/канал) это означало бы, что _act_combat_rotation() в
+                # bot.py мог бы решить кастовать следующую цепочку, пока
+                # этот скилл ещё физически доигрывает анимацию в игре — тот
+                # же класс бага, что уже чинили раньше через is_idle().
+                if cmd[0] == "execute_combo":
+                    cast_time_s = cmd[2] if len(cmd) > 2 else None
+                    if cast_time_s is not None:
+                        # Скилл с известным реальным временем каста —
+                        # ждём ЕГО (±10% джиттер, тот же анти-детект
+                        # принцип, что и у кулдауна цепочки), а не обычную
+                        # короткую межскилльную паузу — 5 секунд каста не
+                        # заменить диапазоном 0.88-1.6с.
+                        gap_s = random.uniform(cast_time_s * 0.9, cast_time_s * 1.1)
+                        gamepad_debug_logger.debug(
+                            "--- GAP после долгого каста: %.1f сек "
+                            "(задано скиллом, ~%.1fс) ---",
+                            gap_s, cast_time_s,
+                        )
+                        self._interruptible_sleep(gap_s)
+                    elif self._DEBUG_FLAT_GAP_S is not None:
+                        # ВРЕМЕННАЯ ветка отладки — см. докстринг
+                        # _DEBUG_FLAT_GAP_S выше. Именно поэтому она стоит
+                        # ПЕРЕД боевой веткой как if/else, а не заменяет
+                        # её: боевая логика (random.choice между двумя
+                        # диапазонами) осталась нетронутой в коде, просто
+                        # временно не выполняется.
+                        gamepad_debug_logger.debug(
+                            "--- GAP между скиллами: %.1f сек (debug-режим) ---",
+                            self._DEBUG_FLAT_GAP_S,
+                        )
+                        self._interruptible_sleep(self._DEBUG_FLAT_GAP_S)
+                    else:
+                        # Между скиллами цепочки — крупная смешанная пауза,
+                        # см. _SKILL_CAST_GAP_BANDS_S. random.choice сначала
+                        # выбирает ОДИН из двух диапазонов (равновероятно), а
+                        # не смешивает их в одну общую границу — иначе
+                        # получился бы снова один сплошной диапазон
+                        # (0.3, 0.7), что мы сознательно не хотим.
+                        band = random.choice(self._SKILL_CAST_GAP_BANDS_S)
+                        self._interruptible_sleep(random.uniform(*band))
+                else:
+                    # Обычная лёгкая пауза между остальными командами
+                    # (автоатака, доворот прицела) — без изменений, крупная
+                    # пауза тут не нужна.
+                    self._interruptible_sleep(random.uniform(0.02, 0.05))
+            finally:
+                # Сюда переехал task_done() (раньше был сразу после
+                # нажатия) — теперь "задача сделана" значит "СОВСЕМ сделана,
+                # включая паузу на докастовку", что и есть настоящее
+                # значение is_idle()/wait_idle(). finally здесь — та же
+                # гарантия, что была раньше: task_done() вызовется даже при
+                # ошибке внутри try выше, иначе wait_idle()/queue.join()
+                # могли бы зависнуть навсегда после одного сбоя.
+                self._queue.task_done()
 
     def _do_press_button(self, action: str) -> None:
         button = self.BUTTON_MAP[action]
@@ -351,6 +533,13 @@ class InputManager:
 
         hold_s = random.uniform(*self._HOLD_BUTTON_MS) / 1000.0
 
+        # Раньше одиночные нажатия (автоатака, доворот target-кнопки) вообще
+        # не попадали в gamepad_debug_logger — писались только целые
+        # комбинации через execute_combo(). В логе из-за этого были "немые"
+        # промежутки между цепочками, будто в паузах ничего не происходило.
+        gamepad_debug_logger.debug(
+            "PRESS   одиночная кнопка %s (action='%s')", button, action
+        )
         self._gamepad.press_button(button=button)
         self._gamepad.update()
 
@@ -361,6 +550,10 @@ class InputManager:
         # нажатой кнопка геймпада эквивалентна залипшей клавише в игре.
         self._gamepad.release_button(button=button)
         self._gamepad.update()
+        gamepad_debug_logger.debug(
+            "        (одиночная кнопка %s отпущена, держали %.0f мс)",
+            button, hold_s * 1000,
+        )
 
     def _do_aim_with_stick(self, dx: float, dy: float) -> None:
         # Нормализуем пиксельное смещение в силу отклонения [-1.0, 1.0].
@@ -439,16 +632,23 @@ class InputManager:
         # что реально нажато, и отпустить именно это на выходе.
         held_buttons: set = set()
 
+        # Начало комбо целиком — одной строкой видно, ЧТО именно бот
+        # собирался нажать, а следующие строки покажут, что из этого
+        # реально долетело до геймпада и в каком порядке/с какими паузами.
+        gamepad_debug_logger.debug("=== COMBO START %s ===", actions)
+
         for action in actions:
             verb, _, target = action.partition("_")
 
             if verb == "hold" and target in self._TRIGGER_SETTERS:
                 getattr(self._gamepad, self._TRIGGER_SETTERS[target])(value_float=1.0)
                 self._gamepad.update()
+                gamepad_debug_logger.debug("HOLD    курок %s", target)
 
             elif verb == "release" and target in self._TRIGGER_SETTERS:
                 getattr(self._gamepad, self._TRIGGER_SETTERS[target])(value_float=0.0)
                 self._gamepad.update()
+                gamepad_debug_logger.debug("RELEASE курок %s", target)
 
             elif verb == "hold" and target in self.BUTTON_MAP:
                 # В отличие от "press" ниже — здесь НЕ отпускаем кнопку
@@ -459,34 +659,44 @@ class InputManager:
                 self._gamepad.press_button(button=button)
                 self._gamepad.update()
                 held_buttons.add(button)
+                gamepad_debug_logger.debug("HOLD    кнопка-модификатор %s", target)
 
             elif verb == "release" and target in self.BUTTON_MAP:
                 button = self.BUTTON_MAP[target]
                 self._gamepad.release_button(button=button)
                 self._gamepad.update()
                 held_buttons.discard(button)
+                gamepad_debug_logger.debug("RELEASE кнопка-модификатор %s", target)
 
             elif verb == "press" and target in self.BUTTON_MAP:
                 button = self.BUTTON_MAP[target]
                 self._gamepad.press_button(button=button)
                 self._gamepad.update()
+                gamepad_debug_logger.debug("PRESS   кнопка %s (down)", target)
                 # Удержание кнопки внутри комбо — та же случайная
                 # длительность, что и у одиночного press_button, чтобы
                 # шаг комбо не отличался статистически от обычной атаки.
-                self._interruptible_sleep(random.uniform(*self._HOLD_BUTTON_MS) / 1000.0)
+                hold_s = random.uniform(*self._HOLD_BUTTON_MS) / 1000.0
+                gamepad_debug_logger.debug("        (держим %s %.0f мс)", target, hold_s * 1000)
+                self._interruptible_sleep(hold_s)
                 self._gamepad.release_button(button=button)
                 self._gamepad.update()
+                gamepad_debug_logger.debug("PRESS   кнопка %s (up)", target)
 
             else:
                 logger.error(
                     "InputManager: неизвестный шаг комбо '%s' — пропущен.", action
                 )
+                gamepad_debug_logger.debug("SKIP    неизвестный шаг '%s'", action)
                 continue
 
             # Микро-пауза между шагами — см. докстринг _COMBO_STEP_DELAY_S.
             # Если паника случилась посреди комбо — прерываем оставшиеся
             # шаги (break), но ОБЯЗАТЕЛЬНО отпускаем всё зажатое ниже.
-            if not self._interruptible_sleep(random.uniform(*self._COMBO_STEP_DELAY_S)):
+            gap_s = random.uniform(*self._COMBO_STEP_DELAY_S)
+            gamepad_debug_logger.debug("        (пауза между шагами %.0f мс)", gap_s * 1000)
+            if not self._interruptible_sleep(gap_s):
+                gamepad_debug_logger.debug("=== COMBO ABORTED (halt_immediately) ===")
                 break
 
         # Страховка на выходе — БЕЗУСЛОВНО отпускаем и курки, и ЛЮБЫЕ
@@ -498,9 +708,11 @@ class InputManager:
         # заметит и не перезапустит бота вручную.
         for button in held_buttons:
             self._gamepad.release_button(button=button)
+            gamepad_debug_logger.debug("SAFETY  отпускаю зависшую кнопку %s", button)
         self._gamepad.left_trigger_float(value_float=0.0)
         self._gamepad.right_trigger_float(value_float=0.0)
         self._gamepad.update()
+        gamepad_debug_logger.debug("=== COMBO END ===")
 
     def _offset_to_stick_force(self, offset_px: float) -> float:
         """Пиксельное смещение -> сила отклонения стика в диапазоне [-1.0, 1.0]."""
