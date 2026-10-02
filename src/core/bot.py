@@ -76,16 +76,49 @@ class FarmBot:
         когда появится ESCAPE: опасность нужно заметить за один кадр,
         а не через секунду после блокирующего ожидания.
 
+    Два источника зрения, две разные роли (2026-10-02):
+        found/hp_percent (жива ли цель, сколько у неё HP — то, что решает
+        переходы SEARCH<->COMBAT) теперь читаются ИЗ ПАНЕЛИ ЦЕЛИ
+        (self._panel_roi, VisionManager.get_panel_target_info) — это
+        фиксированный маленький элемент интерфейса, который появляется
+        ТОЛЬКО когда реально есть выбранная цель, и физически не может
+        зацепить декорацию мира (в отличие от широкой мировой зоны).
+
+        offset_x/offset_y для доворота камеры по-прежнему читаются из
+        летающего бара НАД ГОЛОВОЙ моба (self._target_roi,
+        VisionManager.get_target_info) — панель не привязана к положению
+        моба на экране, этот сигнал только она дать не может.
+
+        Это значит: на каждом тике ДВА отдельных TargetInfo — panel_info
+        (решает found/hp, см. _handle_search/_handle_combat) и aim_info
+        (решает offset, см. _maybe_correct_aim). Они МОГУТ временно
+        расходиться (например, aim_info.found=False на миг, пока моб
+        скрыт деревом, а panel_info.found всё ещё True) — это ожидаемо и
+        не баг: _maybe_correct_aim() просто пропускает коррекцию в такие
+        тики, а panel_info остаётся единственным источником правды про
+        "жив ли таргет".
+
     Довoрот камеры (геймпад):
         После перехода с Interception на виртуальный геймпад (vgamepad +
         ViGEmBus) камера крутится уже не дельтой мыши, а отклонением
         правого стика — это не позиция, а СКОРОСТЬ поворота, зависящая от
         силы отклонения и времени удержания. TargetInfo.offset_x/offset_y
-        (смещение HP-бара от центра ROI в пикселях кадра) передаются в
-        input_manager.aim_with_stick(dx, dy) как сигнал "насколько и в
-        какую сторону довернуть" — перевод пикселей в силу и длительность
-        удержания стика происходит уже внутри InputManager, FSM про это
-        ничего не знает и знать не должна.
+        (смещение HP-бара от центра ROI в пикселях кадра, из aim_info выше)
+        передаются в input_manager.aim_with_stick(dx, dy) как сигнал
+        "насколько и в какую сторону довернуть" — перевод пикселей в силу
+        и длительность удержания стика происходит уже внутри InputManager,
+        FSM про это ничего не знает и знать не должна.
+
+        С этого этапа aim_with_stick() — не команда "выполни довод", а
+        мгновенное обновление позиции цели для НЕПРЕРЫВНОГО фонового
+        потока камеры (InputManager._aim_worker, свой поток, отдельный от
+        очереди боевых комбо). FSM здесь просто репортит зрение каждый
+        тик — когда двигать стик, когда держать паузу, решает уже сам
+        _aim_worker. Подробности и обоснование архитектуры — в докстринге
+        класса InputManager. Единственная обязанность FSM-стороны —
+        вызвать input_manager.clear_aim_target(), когда цель пропала (см.
+        _handle_combat), чтобы фоновый поток не пытался доворачивать
+        камеру к уже неактуальной последней позиции.
     """
 
     _TARGET_FPS = 60
@@ -107,10 +140,20 @@ class FarmBot:
     # на экран, прежде чем искать следующую цель.
     _POST_KILL_DELAY = (0.2, 0.6)
 
-    # Доворот камеры: мёртвая зона (px) и кулдаун коррекции — утверждено
-    # архитектором в диапазонах 15-20px / 300-500мс.
-    _AIM_DEADZONE_PX = 18
-    _AIM_CORRECTION_COOLDOWN = (0.3, 0.5)
+    # Сколько ПОДРЯД времени бар цели должен отсутствовать в ROI, прежде
+    # чем мы поверим, что это настоящая смерть, а не момент, когда моб
+    # увернулся/отбежал и его плывущий HP-бар на миг вышел за границы
+    # (маленькой, статичной) зоны поиска. Фиксированное число, не диапазон
+    # (min, max), как у остальных задержек — это внутренний порог принятия
+    # решения, а не тайминг нажатия кнопки, наружу через ввод он никак не
+    # проявляется, рандомизировать нечего.
+    _TARGET_LOST_GRACE_S = 0.35
+
+    # Доворот камеры: мёртвая зона и вся логика "двигать/ждать/трясти"
+    # переехали в InputManager (_AIM_DEADZONE_PX и параметры непрерывной
+    # модели прицеливания — см. докстринг InputManager._aim_worker) — с
+    # переходом на непрерывный фоновый _aim_worker именно InputManager, а
+    # не FSM, решает "двигать или ждать" на основе самой свежей цели.
 
     # Пауза ПОСЛЕ успешного каста скилла — грубая оценка длительности
     # анимации, чтобы FSM не пыталась тут же спамить следующее действие
@@ -119,6 +162,16 @@ class FarmBot:
     # __init__ и skills_config.json) — это отдельная, более короткая
     # пауза "не мешай текущему касту".
     _SKILL_CAST_DELAY = (0.4, 0.8)
+
+    # Как часто пишем в gamepad_debug.log текущее состояние зрения
+    # (found/hp/offset) — единственный способ УВИДЕТЬ вживую во время
+    # реального прогона (F5), что VisionManager реально что-то находит и
+    # какие числа считает, не поднимая отдельное cv2.imshow-окно (то окно
+    # живёт только в песочнице vision_manager.py — поднимать его из
+    # фонового потока бота конфликтовало бы с окном pywebview, оба тянут
+    # на себя оконный цикл ОС). Раз в секунду, а не каждый тик — иначе
+    # 60 строк в секунду утопили бы полезные AIM/COMBO записи в том же файле.
+    _VISION_LOG_INTERVAL_S = 1.0
 
     def __init__(self) -> None:
         self.vision = VisionManager()
@@ -136,16 +189,31 @@ class FarmBot:
             vision_config.TARGET_HP_HEIGHT,
         )
 
+        # Панель цели (2026-10-02) — ВТОРАЯ, отдельная зона захвата, см.
+        # докстринг класса "Два источника зрения, две разные роли". Тоже
+        # считается один раз здесь, а не на каждом тике — те же причины,
+        # что и у self._target_roi выше.
+        self._panel_roi = self.vision.build_roi(
+            vision_config.TARGET_PANEL_OFFSET_X,
+            vision_config.TARGET_PANEL_OFFSET_Y,
+            vision_config.TARGET_PANEL_WIDTH,
+            vision_config.TARGET_PANEL_HEIGHT,
+        )
+
         self.state: State = State.SEARCH
 
         # Таймер следующего действия ТЕКУЩЕГО состояния. 0.0 — действие
         # выполнится уже на первом тике, ждать разогрева не нужно.
         self._next_action_at: float = 0.0
 
-        # ОТДЕЛЬНЫЙ таймер для коррекции прицела — независимый от
-        # _next_action_at (тот отвечает за tab/атаку). Довoрот камеры и
-        # нажатие клавиш логически разные события с разной частотой.
-        self._next_aim_correction_at: float = 0.0
+        # Таймер троттлинга VISION-строк в gamepad_debug.log — см.
+        # _VISION_LOG_INTERVAL_S и _log_vision_status().
+        self._next_vision_log_at: float = 0.0
+
+        # Момент (time.monotonic()), когда бар цели ПЕРВЫЙ раз пропал из
+        # ROI подряд, None — если сейчас бар виден или отсчёт ещё не
+        # начинался. См. _TARGET_LOST_GRACE_S и _handle_combat().
+        self._target_lost_since: float | None = None
 
         # Флаг "автоатака уже запущена персонажем и продолжает идти сама".
         # В игре одно нажатие RB запускает цикл автоатаки, который крутится
@@ -239,22 +307,40 @@ class FarmBot:
     # Обработчики состояний
     # ------------------------------------------------------------------
 
+    # Аналог Tab с компа на геймпаде T&L — НЕ R3 (тот "Set Lock-On/Cancel":
+    # хватает то, на что СЕЙЧАС смотрит камера, требует точного прицела).
+    # Настоящий переключатель цели — "Change Target": RB (удержание) + Y
+    # (источник — тот же гайд Game8, что и весь остальной BUTTON_MAP).
+    # Формат шагов — тот же, что возвращает InputManager.parse_combo_string
+    # для строки "RB+Y": удержали RB как модификатор, нажали Y, отпустили RB.
+    _SEARCH_TARGET_COMBO = ["hold_RB", "press_Y", "release_RB"]
+
     def _handle_search(self) -> None:
         """
-        SEARCH: раз в ~секунду жмём кнопку захвата цели (R3 по дефолту
-        T&L, см. InputManager.BUTTON_MAP['target']), ищем цель.
-        Если зрение видит таргет — сразу довoрачиваем камеру на него
-        (первый снап, а не робот-мгновенность — деталь в _maybe_correct_aim)
-        и переключаемся в COMBAT.
+        SEARCH: раз в ~секунду жмём "Change Target" (RB+Y — см.
+        _SEARCH_TARGET_COMBO), ищем цель. "Нашли ли цель" решает ПАНЕЛЬ
+        (panel_info.found, см. докстринг класса) — это и есть переход в
+        COMBAT. Мировой бар (aim_info) используется ТОЛЬКО если он тоже
+        виден в этот самый тик — довoрачиваем камеру сразу при обнаружении,
+        но его отсутствие в конкретном кадре не мешает переходу в COMBAT.
         """
-        # Один захват экрана даёт разом found/hp/offset — см. докстринг
-        # класса VisionManager про то, почему это ОДИН метод, а не три.
-        info = self.vision.get_target_info(self._target_roi)
+        panel_info = self.vision.get_panel_target_info(self._panel_roi)
+        aim_info = self.vision.get_target_info(self._target_roi)
+        now = time.monotonic()
+        self._log_vision_status(panel_info, aim_info, now)
 
-        if info.found:
-            logger.info("SEARCH -> COMBAT: цель обнаружена, довoрачиваем камеру.")
-            self._next_aim_correction_at = 0.0  # форсируем немедленный первый доворот
-            self._maybe_correct_aim(info, time.monotonic())
+        if panel_info.found:
+            logger.info("SEARCH -> COMBAT: цель обнаружена (панель).")
+            # Дублируем в gamepad_debug.log (2026-10-02): logger.info выше
+            # идёт только в консоль — её не видно постфактум без доступа к
+            # живому терминалу. Переходы состояний нужны в ОДНОМ файле
+            # вместе с VISION/COMBO/ROTATION, иначе при разборе лога после
+            # игровой сессии невозможно понять, какое именно состояние
+            # породило тот или иной нажатый комбо (ровно это и мешало
+            # диагностике бага "обрывается цепочка/застревает SEARCH").
+            gamepad_debug_logger.debug("STATE   SEARCH -> COMBAT (панель нашла цель)")
+            if aim_info.found:
+                self._maybe_correct_aim(aim_info)
             self.state = State.COMBAT
             self._next_action_at = 0.0
             # Новая цель — если раньше уже была запущена автоатака (по
@@ -263,36 +349,96 @@ class FarmBot:
             self._autoattack_engaged = False
             return
 
-        now = time.monotonic()
         if now >= self._next_action_at:
-            self.input_manager.press_button("target")
+            self.input_manager.execute_combo(self._SEARCH_TARGET_COMBO)
             self._next_action_at = now + random.uniform(*self._SEARCH_TAB_COOLDOWN)
 
     def _handle_combat(self) -> None:
         """
         COMBAT: когда таймер действия готов — идём по ротации скиллов
         (см. _act_combat_rotation), иначе просто доворачиваем прицел.
-        Если таргет пропал (убит) — сразу возвращаемся в SEARCH.
+        Если таргет пропал — уходим в SEARCH, но не по ОДНОМУ пропущенному
+        кадру (см. self._target_lost_since и _TARGET_LOST_GRACE_S ниже),
+        а только если пропажа держится дольше грейс-периода.
+
+        "Жива ли цель" теперь решает ПАНЕЛЬ (panel_info.found, см.
+        докстринг класса про два источника зрения) — мировой бар
+        (aim_info) используется только для доворота камеры, когда он сам
+        виден в конкретном кадре; его временное исчезновение (моб на миг
+        скрылся за деревом) больше НЕ считается сигналом смерти.
 
         LOOT намеренно нет: в игре подбор дропа автоматический, отдельного
         нажатия/состояния для этого не требуется.
         """
-        info = self.vision.get_target_info(self._target_roi)
+        panel_info = self.vision.get_panel_target_info(self._panel_roi)
+        aim_info = self.vision.get_target_info(self._target_roi)
+        now = time.monotonic()
+        self._log_vision_status(panel_info, aim_info, now)
 
-        if not info.found:
+        if not panel_info.found:
+            # ПЕРВЫЙ кадр без панели — ещё не факт смерти. Панель куда
+            # стабильнее мирового бара (фиксированная зона, не привязана
+            # к положению моба), но один сбойный кадр захвата (mss)/кадр
+            # посреди анимации смены цели в самой игре всё ещё возможен —
+            # грейс-период остаётся дешёвой страховкой на этот случай, а
+            # не основной защитой, как было раньше с мировым баром.
+            # Настоящая смерть даёт found=False СТАБИЛЬНО много кадров
+            # подряд (панель пропадает совсем) — грейс-период отличает эти
+            # два случая по длительности пропажи, а не по одному кадру.
+            if self._target_lost_since is None:
+                self._target_lost_since = now
+            if now - self._target_lost_since < self._TARGET_LOST_GRACE_S:
+                # Ждём, не трогая ни ротацию, ни прицел — по свежему
+                # мгновенному "офсету" несуществующего бара (0,0) камера
+                # дёрнулась бы к центру ROI на пустом месте.
+                return
+
+            missing_for_s = now - self._target_lost_since
             logger.info("COMBAT -> SEARCH: цель пропала (убита), лут автоматический.")
+            # Та же причина, что и у STATE-строки в _handle_search() выше —
+            # но здесь ЕЩЁ важнее: именно это место чистит очередь ротации
+            # (cancel_pending_actions() ниже), и единственный способ отличить
+            # в логе "обвал цепочки из-за настоящей пропажи панели" от
+            # "это SEARCH сам по себе спамит тот же физический комбо" —
+            # увидеть ИМЕННО эту строку с реальной длительностью пропажи.
+            gamepad_debug_logger.debug(
+                "STATE   COMBAT -> SEARCH (панель отсутствовала %.2fс подряд, "
+                "грейс-период %.2fс) -> cancel_pending_actions()",
+                missing_for_s, self._TARGET_LOST_GRACE_S,
+            )
             self.state = State.SEARCH
-            now = time.monotonic()
+            # Выбрасываем ещё не начатые шаги ротации, оставшиеся в
+            # очереди с момента ДО смерти цели (например, цепочка из
+            # 4 скиллов, а моб умер после второго) — без этого бот
+            # доигрывает их уже в пустоту, выглядит как "бьёт воздух/труп".
+            # НЕ halt_immediately() — та ещё и резко обнуляет геймпад,
+            # это для панической F4-остановки, не для обычного килла.
+            self.input_manager.cancel_pending_actions()
+            # Гасим цель фонового _aim_worker — без этого он продолжил бы
+            # пытаться довoрачивать камеру к последней позиции мёртвой
+            # цели вплоть до следующего успешного aim_with_stick().
+            self.input_manager.clear_aim_target()
+            # И "память" зрения о позиции бара — см. VisionManager.
+            # reset_tracking(): без сброса поиск новой цели сравнивал бы
+            # кандидатов с координатами уже мёртвой цели, вместо того
+            # чтобы честно взять самого широкого заново.
+            self.vision.reset_tracking()
+            self._target_lost_since = None
             # Небольшая случайная пауза перед первым Tab — см. комментарий
             # к _POST_KILL_DELAY: мгновенная реакция здесь неестественна.
             self._next_action_at = now + random.uniform(*self._POST_KILL_DELAY)
             return
 
-        now = time.monotonic()
+        # Панель снова видна — сбрасываем счётчик грейс-периода, даже
+        # если он был запущен секунду назад: цель жива, отсчёт больше не
+        # нужен.
+        self._target_lost_since = None
+
         if now >= self._next_action_at:
             self._act_combat_rotation(now)
 
-        self._maybe_correct_aim(info, now)
+        if aim_info.found:
+            self._maybe_correct_aim(aim_info)
 
     def _act_combat_rotation(self, now: float) -> None:
         """
@@ -412,37 +558,53 @@ class FarmBot:
 
         self._next_action_at = now + random.uniform(*self._COMBAT_ATTACK_COOLDOWN)
 
-    def _maybe_correct_aim(self, info: TargetInfo, now: float) -> None:
+    def _maybe_correct_aim(self, aim_info: TargetInfo) -> None:
         """
-        Общая логика доворота камеры — используется и при первом обнаружении
-        цели в SEARCH, и периодически в COMBAT. Один метод вместо копипасты
-        в оба обработчика: правило "когда и на сколько довернуть" одно и то
-        же, различается только момент вызова.
-
-        Собственный кулдаун (_next_aim_correction_at) не даёт слать команду
-        коррекции чаще, чем раз в _AIM_CORRECTION_COOLDOWN: aim_with_stick
-        занимает воркер InputManager на сотни мс (разгон + удержание +
-        торможение стика), и если гнать новую команду каждый тик, очередь
-        будет расти быстрее, чем успевает опустошаться — коррекции
-        накопятся с лагом и будут применяться к уже устаревшему положению
-        цели.
+        Репортит СВЕЖУЮ позицию цели в InputManager — вызывается КАЖДЫЙ
+        тик, когда МИРОВОЙ бар виден (aim_info.found — см. докстринг
+        класса про два источника зрения; это НЕ то же самое, что "жива ли
+        цель", за то отвечает панель). Раньше этот метод сам решал "пора
+        ли доворачивать" (свой кулдаун _next_aim_correction_at + мёртвая
+        зона) и слал aim_with_stick() как разовую команду в очередь
+        InputManager — теперь это просто мгновенная запись в "почтовый
+        ящик" фонового _aim_worker (см. InputManager.aim_with_stick()),
+        дешёвая операция, которую можно (и нужно) звать каждый тик.
+        Решение "двигать стик сейчас или ждать" (мёртвая зона, сглаживание,
+        тремор, реализм) принимает уже сам _aim_worker в своём потоке —
+        FSM здесь только поставляет самые свежие координаты, ничего не
+        решая сама.
         """
-        if now < self._next_aim_correction_at:
+        self.input_manager.aim_with_stick(aim_info.offset_x, aim_info.offset_y)
+
+    def _log_vision_status(
+        self, panel_info: TargetInfo, aim_info: TargetInfo, now: float
+    ) -> None:
+        """
+        Троттлированная строка VISION в gamepad_debug.log — раз в
+        _VISION_LOG_INTERVAL_S, а не каждый тик (иначе 60 строк в секунду
+        утопили бы полезные AIM/COMBO записи в том же файле). Единственный
+        способ УВИДЕТЬ вживую во время реального прогона (F5), что
+        VisionManager реально что-то находит и какие числа считает, не
+        поднимая отдельное cv2.imshow-окно (то живёт только в песочнице
+        vision_manager.py).
+
+        Печатает ОБА источника раздельно (панель — источник правды про
+        found/hp, мировой бар — источник offset для прицела) — иначе по
+        логу было бы не видно случаев их расхождения (см. докстринг
+        класса), а это самое интересное место для отладки.
+        """
+        if now < self._next_vision_log_at:
             return
-
-        self._next_aim_correction_at = now + random.uniform(*self._AIM_CORRECTION_COOLDOWN)
-
-        # Мёртвая зона: бар и так возле центра ROI (шум детекции в пару
-        # пикселей неизбежен, даже если цель не двигалась) — довoрачивать
-        # камеру ради 2px означало бы дёргать мышь без реальной необходимости.
-        if abs(info.offset_x) <= self._AIM_DEADZONE_PX and abs(info.offset_y) <= self._AIM_DEADZONE_PX:
-            return
-
-        # Передаём offset НАПРЯМУЮ, без round() — в отличие от старой
-        # мышиной версии, где offset шёл в целочисленную дельту курсора,
-        # здесь offset лишь пересчитывается в float-силу стика (см.
-        # InputManager._offset_to_stick_force), дробная точность не лишняя.
-        self.input_manager.aim_with_stick(info.offset_x, info.offset_y)
+        self._next_vision_log_at = now + self._VISION_LOG_INTERVAL_S
+        if panel_info.found:
+            gamepad_debug_logger.debug(
+                "VISION  panel: found=True hp=%.1f%%  |  aim: found=%s offset=(%+.1f, %+.1f)",
+                panel_info.hp_percent, aim_info.found, aim_info.offset_x, aim_info.offset_y,
+            )
+        else:
+            gamepad_debug_logger.debug(
+                "VISION  panel: found=False (цели нет)  |  aim: found=%s", aim_info.found
+            )
 
 
 # ----------------------------------------------------------------------
@@ -461,7 +623,14 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     class _MockVision:
-        """Мок VisionManager: get_target_info управляется вручную по сценарию."""
+        """
+        Мок VisionManager: ДВА метода зрения (панель + мировой бар), см.
+        докстринг класса FarmBot про "два источника зрения, две разные
+        роли". bot.py вызывает get_panel_target_info() ПЕРВЫМ на каждом
+        тике — счётчик self._tick увеличивается именно там, а
+        get_target_info() просто читает уже обновлённое значение, чтобы
+        оба мок-метода оставались синхронны внутри одного тика FSM.
+        """
 
         def __init__(self) -> None:
             self._tick = 0
@@ -469,11 +638,26 @@ if __name__ == "__main__":
         def build_roi(self, *_args, **_kwargs) -> dict:
             return {"left": 0, "top": 0, "width": 300, "height": 300}
 
-        def get_target_info(self, _roi: dict) -> TargetInfo:
+        def reset_tracking(self) -> None:
+            logger.info("[MOCK VISION] reset_tracking()")
+
+        def get_panel_target_info(self, _roi: dict) -> TargetInfo:
             self._tick += 1
             # Сценарий: первые ~2 сек цели нет (SEARCH ищет), затем ~3 сек
-            # цель есть и "гуляет" синусоидой по X (проверяем, что COMBAT
-            # периодически шлёт коррекцию прицела), потом цель пропадает.
+            # цель есть (панель её видит), потом цель пропадает.
+            found = 120 < self._tick < 300
+            return TargetInfo(
+                found=found,
+                hp_percent=75.0 if found else 0.0,
+                offset_x=0.0,
+                offset_y=0.0,
+            )
+
+        def get_target_info(self, _roi: dict) -> TargetInfo:
+            # Мировой бар: тот же found-сценарий (для простоты мока — в
+            # реальности они могут на миг расходиться, см. докстринг
+            # класса), но ещё и "гуляет" синусоидой по X — проверяем, что
+            # COMBAT периодически шлёт коррекцию прицела.
             found = 120 < self._tick < 300
             offset_x = 40.0 * math.sin(self._tick / 15) if found else 0.0
             return TargetInfo(
@@ -489,8 +673,24 @@ if __name__ == "__main__":
         def press_button(self, action: str) -> None:
             logger.info("[MOCK INPUT] press_button('%s')", action)
 
+        def execute_combo(self, actions: list, cast_time_s: float | None = None) -> None:
+            logger.info("[MOCK INPUT] execute_combo(%s)", actions)
+
+        def cancel_pending_actions(self) -> None:
+            logger.info("[MOCK INPUT] cancel_pending_actions()")
+
         def aim_with_stick(self, dx: float, dy: float) -> None:
             logger.info("[MOCK INPUT] aim_with_stick(dx=%.1f, dy=%.1f)", dx, dy)
+
+        def clear_aim_target(self) -> None:
+            logger.info("[MOCK INPUT] clear_aim_target()")
+
+        def is_idle(self) -> bool:
+            # _act_combat_rotation() гейтится на is_idle() ПЕРЕД тем, как
+            # решить, кастовать ли цепочку/автоатаку — реальный
+            # InputManager держит здесь состояние очереди, мок всегда
+            # "свободен", этого достаточно для проверки переходов FSM.
+            return True
 
         def stop(self) -> None:
             pass
@@ -503,9 +703,12 @@ if __name__ == "__main__":
     bot.vision = _MockVision()
     bot.input_manager = _MockInput()
     bot._target_roi = bot.vision.build_roi()
+    bot._panel_roi = bot.vision.build_roi()
     bot.state = State.SEARCH
     bot._next_action_at = 0.0
-    bot._next_aim_correction_at = 0.0
+    bot._next_vision_log_at = 0.0
+    bot._target_lost_since = None
+    bot._autoattack_engaged = False
     # Пустой список — в песочнице ротация всегда падает на автоатаку,
     # этого достаточно, чтобы проверить переходы состояний. Реальные
     # цепочки с ROI тестируются только в игре, не в этой песочнице.

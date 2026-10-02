@@ -21,11 +21,33 @@ Operational дважды проверялся и не содержал ни од
 архитектуру это не влияет — оно верное само по себе, — но пусть в
 комментариях останется точная причина, а не гипотеза, которая не
 подтвердилась.
+
+Архитектура потоков (ВАЖНО): внутри работают ДВА независимых
+демон-потока, не один.
+  - _worker — как и раньше, разбирает queue.Queue с кнопками/комбо
+    (press_button/execute_combo). FIFO тут уместен: комбо должно
+    доиграть шаг за шагом по порядку.
+  - _aim_worker — НЕПРЕРЫВНЫЙ цикл доворота камеры, свой отдельный
+    поток, вообще без очереди (см. докстринг _aim_worker). Раньше
+    aim_with_stick() тоже клал команду в общую с комбо очередь — если
+    воркер был занят долгим комбо, коррекция камеры применялась с
+    опозданием, уже к устаревшей позиции цели. Разделение потоков это
+    чинит: доворот камеры больше не ждёт своей очереди за боем.
+
+Оба потока пишут в ОДИН и тот же self._gamepad (виртуальное
+устройство) — сам vgamepad не потокобезопасен, поэтому КАЖДАЯ мутация
+геймпада (press_button/release_button/left_trigger_float/
+right_trigger_float/right_joystick_float) и следующий за ней update()
+обёрнуты в self._gamepad_lock. Лок берётся на каждый ОТДЕЛЬНЫЙ вызов
+(не на весь цикл/комбо целиком) — иначе долгий каст комбо держал бы
+лок секундами и блокировал бы _aim_worker от обновления стика 50 раз в
+секунду, что и есть его прямая задача.
 """
 
 import os
 import time
 import random
+import math
 import logging
 import threading
 import queue
@@ -59,15 +81,41 @@ _gamepad_log_handler.setFormatter(
 gamepad_debug_logger.addHandler(_gamepad_log_handler)
 
 
-def _smoothstep(t: float) -> float:
+def _aim_curve(offset_px: float, max_offset_px: float, deadzone_px: float, exponent: float) -> float:
     """
-    Плавная кривая ease-in-out: 0 на старте, 1 в конце, с нулевой
-    скоростью на обоих концах. Та же формула, что раньше использовалась
-    для доворота мыши через Безье — человеческая рука не разгоняет и не
-    останавливает стик мгновенно, скачок силы 0 -> 1 за один тик выдаёт
-    себя как программное действие сразу же, если логировать сырой ввод.
+    Пиксельное смещение цели от центра ROI -> "куда сейчас тянет стик"
+    в диапазоне [-1.0, 1.0]. Чистая функция, без состояния — вызывается
+    заново каждый тик _aim_worker с самым свежим offset.
+
+    exponent < 1 (у нас 0.45) даёт ВОГНУТУЮ кривую — сила растёт БЫСТРО
+    сразу за дедзоной, а не полого, как у smoothstep (3t²-2t³, нулевая
+    производная на старте). Именно нулевая производная smoothstep и
+    была причиной бага "камера не двигается 10-15 секунд, потом рывок":
+    сила у самой границы дедзоны получалась ниже собственной мёртвой
+    зоны стика В ИГРЕ, и движение было не видно, пока offset не
+    вырастал прилично — тогда игровая дедзона наконец пробивалась, и
+    выглядело это как резкий скачок. Вогнутая кривая пробивает игровую
+    дедзону сразу за нашей.
     """
-    return 3 * t**2 - 2 * t**3
+    if abs(offset_px) <= deadzone_px:
+        return 0.0
+    span = max(max_offset_px - deadzone_px, 1.0)
+    t = min((abs(offset_px) - deadzone_px) / span, 1.0)
+    magnitude = t ** exponent
+    return magnitude if offset_px > 0 else -magnitude
+
+
+def _ou_step(value: float, theta: float, sigma: float, dt: float) -> float:
+    """
+    Один шаг процесса Орнштейна-Уленбека — ограниченное случайное
+    блуждание с возвратом к нулю (mean-reverting). Используется как
+    тремор стика: не белый шум (не коррелированные тик за тиком скачки
+    выглядят нечеловечески — реальная рука дрожит ПЛАВНО) и не синус
+    (слишком периодично, легко ловится анализом частоты). theta — сила
+    притяжения к нулю (не даёт тремору "уплыть" в сторону), sigma —
+    амплитуда случайной добавки на шаг.
+    """
+    return value + theta * (0.0 - value) * dt + sigma * math.sqrt(dt) * random.gauss(0.0, 1.0)
 
 
 class InputManager:
@@ -141,45 +189,49 @@ class InputManager:
     # недостижима для человека и является явным паттерном для анализа.
     _REACTION_DELAY_S = (0.0, 0.05)
 
-    # Сколько мс держим стик отклонённым НА ПИКЕ силы (после разгона,
-    # до начала торможения) за один "довод" камеры. Стик — это НЕ дельта,
-    # как было у мыши (bezier_move_relative двигал курсор ровно на dx,dy
-    # и всё). Стик — это скорость поворота: чем дольше держишь отклонённым
-    # и чем сильнее отклонение, тем больше суммарный доворот камеры.
-    # Поэтому здесь два параметра (сила + время), а не один.
-    _AIM_HOLD_MS = (40, 90)
+    # --- Непрерывная модель камеры ("спринг + тремор") ---
+    # Заменяет старую дискретную модель "разгон -> удержание с
+    # джиттером -> торможение" на один НЕПРЕРЫВНЫЙ фоновый цикл
+    # (_aim_worker). Дискретная модель между отдельными "доводами"
+    # держала стик мёртво в нуле — реальный человек так не целится,
+    # камера у него постоянно чуть ходит вокруг цели.
 
-    # Длительность плавного разгона стика от нуля до целевой силы и
-    # симметричного торможения обратно в ноль. Реальная рука не
-    # телепортирует стик в крайнее положение мгновенно — она проходит
-    # через промежуточные отклонения, как и с движением мыши по Безье.
-    _AIM_RAMP_MS = (50, 90)
+    # Частота тика фонового цикла доворота камеры. 50Гц — заметно чаще
+    # 60 FPS игрового цикла не нужно (человеческая реакция на стике
+    # физически медленнее), но и не настолько редко, чтобы спринг
+    # выглядел ступенчатым.
+    _AIM_TICK_S = 0.02
 
-    # Сколько промежуточных шагов делаем за время разгона/торможения.
-    # Больше шагов — плавнее кривая, но больше вызовов update() за то же
-    # время. 4-7 достаточно, чтобы кривая не выглядела скачком, и мало
-    # для того, чтобы создать заметную нагрузку на 60 FPS цикл.
-    _AIM_RAMP_STEPS = (4, 7)
+    # Пиксельное смещение цели от центра ROI, внутри которого камера
+    # считается "уже на цели" и не доворачивается вовсе — шум детекции
+    # даёт пару пикселей дрожания бара даже у неподвижной цели.
+    _AIM_DEADZONE_PX = 18.0
 
-    # Во время удержания на пике добавляем несколько микро-тиков с
-    # небольшим случайным дрожанием вокруг целевой силы — человеческий
-    # большой палец на стике никогда не держит идеально одно и то же
-    # положение, там всегда есть микротремор.
-    _AIM_JITTER_TICKS = (2, 4)
-    _AIM_JITTER_AMOUNT = 0.05
-
-    # Пиксельное смещение таргета от центра ROI, при котором сила
-    # отклонения стика достигает максимума (1.0). Берём половину ширины
-    # ROI таргета (у нас ROI 300px, см. vision_config.TARGET_HP_WIDTH)
-    # как естественный масштаб: цель редко уезжает дальше половины зоны
-    # обнаружения, не потеряв трекинг совсем.
+    # Пиксельное смещение, при котором _aim_curve выходит на максимум
+    # силы (1.0). Половина ширины ROI таргета — цель редко уезжает
+    # дальше половины зоны обнаружения, не потеряв трекинг совсем.
     _AIM_MAX_OFFSET_PX = 150.0
 
-    # Минимальная сила отклонения стика, гарантированная даже для
-    # маленького offset — у контроллеров и в самой игре обычно есть своя
-    # мёртвая зона стика, и слишком слабое отклонение просто не даст
-    # эффекта на экране. Без этого пола мелкие коррекции были бы "немыми".
-    _AIM_MIN_FORCE = 0.15
+    # Постоянная времени экспоненциального сглаживания (RC-фильтр),
+    # которым текущее положение стика подтягивается к "желаемому" от
+    # _aim_curve — она же и создаёт задержку реакции, и плавность.
+    # Диапазон, не одно число: "собранность" реального игрока не
+    # константна весь бой. Периодически перевыбирается заново, см.
+    # _AIM_TAU_REROLL_S.
+    _AIM_SMOOTH_TIME_S = (0.15, 0.35)
+    _AIM_TAU_REROLL_S = (2.0, 4.5)
+
+    # Параметры тремора (процесс Орнштейна-Уленбека, см. _ou_step) —
+    # theta тянет тремор к нулю, не давая ему "уплыть", sigma — сила
+    # случайной добавки за тик.
+    _AIM_TREMOR_THETA = 3.0
+    _AIM_TREMOR_SIGMA = 0.035
+
+    # Показатель степени вогнутой кривой offset -> сила в _aim_curve.
+    # < 1 => сила растёт быстро сразу за дедзоной (не как у плавного
+    # smoothstep с нулевой производной на старте) — см. докстринг
+    # _aim_curve про баг "камера не двигается 10-15с, потом рывок".
+    _AIM_CURVE_EXPONENT = 0.45
 
     # Пауза МЕЖДУ шагами комбо (например, между 'hold_LT' и 'press_X').
     # Это не только анти-детект: если отправить нажатие кнопки СРАЗУ же
@@ -268,13 +320,48 @@ class InputManager:
         self._running = True
         self._abort_event = threading.Event()
 
+        # Один лок на ФИЗИЧЕСКОЕ устройство — оба воркера (кнопки/комбо
+        # и камера) пишут в один и тот же self._gamepad, а сам vgamepad
+        # не потокобезопасен. См. докстринг модуля про то, почему лок
+        # берётся на каждый отдельный вызов, а не на весь цикл целиком.
+        self._gamepad_lock = threading.Lock()
+
+        # "Почтовый ящик" последней известной позиции цели для
+        # _aim_worker — НЕ queue.Queue. Очередь копила бы ИСТОРИЮ
+        # офсетов и применяла их с опозданием, если воркер занят чем-то
+        # другим; здесь вместо истории — только "последнее известное
+        # значение", перечитываемое на каждом тике _aim_worker.
+        self._aim_lock = threading.Lock()
+        self._aim_dx = 0.0
+        self._aim_dy = 0.0
+        # Отдельно от (_aim_dx, _aim_dy) — это НЕ "офсет сейчас вне
+        # дедзоны", а "жива ли вообще цель" (True с момента
+        # aim_with_stick(), False только после clear_aim_target()/
+        # halt_immediately()). Нужно разделять: у реально удерживаемой
+        # цели офсет из-за шума детекции постоянно чуть колеблется
+        # вокруг центра ROI и то ныряет в дедзону, то выныривает — если
+        # гасить тремор по дедзоне, а не по этому флагу, он мигал бы
+        # вкл/выкл на каждом таком пересечении границы (см. докстринг
+        # _aim_worker).
+        self._aim_engaged = False
+
         # daemon=True — тот же приём, что и раньше: поток ввода не
         # должен мешать процессу завершиться, если что-то пойдёт не так.
         self._worker_thread = threading.Thread(
             target=self._worker, daemon=True, name="InputWorker"
         )
         self._worker_thread.start()
-        logger.debug("InputManager (vgamepad) инициализирован, воркер запущен.")
+
+        # Второй, НЕЗАВИСИМЫЙ поток — непрерывный доворот камеры. Не
+        # использует self._queue вообще (см. докстринг _aim_worker и
+        # модуля) — работает всё время жизни InputManager, независимо
+        # от того, чем занят _worker (кнопки/комбо).
+        self._aim_worker_thread = threading.Thread(
+            target=self._aim_worker, daemon=True, name="AimWorker"
+        )
+        self._aim_worker_thread.start()
+
+        logger.debug("InputManager (vgamepad) инициализирован, оба воркера запущены.")
 
     # ================= Публичное API =================
 
@@ -292,11 +379,39 @@ class InputManager:
 
     def aim_with_stick(self, dx: float, dy: float) -> None:
         """
-        Ставит в очередь коррекцию камеры правым стиком на основе
-        смещения таргета (dx, dy) в пикселях от центра ROI — тот же
-        сигнал, что раньше шёл напрямую в bezier_move_relative.
+        Сообщает _aim_worker САМОЕ СВЕЖЕЕ смещение таргета (dx, dy) в
+        пикселях от центра ROI — тот же сигнал, что раньше шёл напрямую
+        в bezier_move_relative.
+
+        Это мгновенная перезапись "почтового ящика" под _aim_lock — НЕ
+        queue.put(). Вызывающий поток (FSM, 60 FPS) не ждёт и не
+        блокируется: раньше это был queue.put() в общую с combo очередь,
+        и при занятом воркере офсет мог применяться с опозданием на
+        секунды. Теперь можно (и нужно) звать этот метод КАЖДЫЙ тик,
+        пока видна цель — это дешёвая запись двух float'ов, а не тяжёлая
+        постановка задачи. Решение "двигать стик или ждать" (мёртвая
+        зона, паузы, реализм) принимает уже сам _aim_worker, не вызывающая
+        сторона.
         """
-        self._queue.put(("aim_with_stick", dx, dy))
+        with self._aim_lock:
+            self._aim_dx = dx
+            self._aim_dy = dy
+            self._aim_engaged = True
+
+    def clear_aim_target(self) -> None:
+        """
+        Сообщает _aim_worker, что цель потеряна — эквивалентно "цель
+        идеально в центре ROI" (0, 0) И "тремор больше не нужен" (см.
+        self._aim_engaged в __init__). Без явного вызова этого метода при
+        потере цели _aim_worker продолжал бы хранить и пытаться
+        доворачивать камеру к ПОСЛЕДНЕМУ известному (уже неактуальному)
+        смещению до следующего вызова aim_with_stick — вызывай его из FSM
+        в момент перехода COMBAT -> SEARCH (цель убита/пропала).
+        """
+        with self._aim_lock:
+            self._aim_dx = 0.0
+            self._aim_dy = 0.0
+            self._aim_engaged = False
 
     def execute_combo(self, actions: list[str], cast_time_s: float | None = None) -> None:
         """
@@ -369,6 +484,32 @@ class InputManager:
             f"в T&L на геймпаде это не встречается, проверь конфиг."
         )
 
+    def cancel_pending_actions(self) -> None:
+        """
+        Выбрасывает всё, что ещё ЖДЁТ своей очереди у _worker (шаги
+        ротации/комбо, которые ещё не начали исполняться) — но НЕ трогает
+        то, что воркер УЖЕ физически начал исполнять прямо сейчас (та
+        команда уже вытащена из очереди и доиграет естественно до конца;
+        обрывать нажатие кнопки на середине грубее, чем просто не
+        начинать следующие).
+
+        Это НЕ halt_immediately() — та ещё и ставит _abort_event, и
+        обнуляет геймпад/стик, что здесь избыточно (и даже вредно): цель
+        просто умерла в обычном бою, не нужно резко дёргать геймпад в
+        ноль на каждый килл, это для настоящей паники (F4).
+
+        Зови из FSM в момент ПОДТВЕРЖДЁННОЙ смерти цели. Без этого шаги
+        цепочки, поставленные в очередь ДО смерти (например, цепочка из
+        4 скиллов, а моб умер после второго), доиграют в пустоту уже
+        после смерти — выглядит как "бот продолжает драться с трупом".
+        """
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+            except queue.Empty:
+                break
+
     def halt_immediately(self) -> None:
         """
         Экстренная остановка (F4-пауза). Прерывает текущее удержание
@@ -387,9 +528,20 @@ class InputManager:
             except queue.Empty:
                 break
 
+        # Гасим цель фонового _aim_worker тем же способом, что и
+        # clear_aim_target() — иначе он продолжит доворачивать камеру к
+        # последней цели уже ПОСЛЕ паники.
+        with self._aim_lock:
+            self._aim_dx = 0.0
+            self._aim_dy = 0.0
+            self._aim_engaged = False
+
         try:
-            self._gamepad.reset()
-            self._gamepad.update()
+            # Под _gamepad_lock — см. докстринг класса: _aim_worker может
+            # в любой момент писать в тот же self._gamepad параллельно.
+            with self._gamepad_lock:
+                self._gamepad.reset()
+                self._gamepad.update()
         except Exception as e:
             logger.error("InputManager: ошибка при экстренном сбросе геймпада: %s", e)
 
@@ -398,11 +550,17 @@ class InputManager:
         self._abort_event.clear()
 
     def stop(self) -> None:
-        """Штатная остановка — дожидается опустошения очереди, затем гасит воркер."""
+        """Штатная остановка — дожидается опустошения очереди, затем гасит оба воркера."""
         self._queue.join()
         self._running = False
-        self._gamepad.reset()
-        self._gamepad.update()
+        # _aim_worker сам проверяет self._running на каждом тике (см. его
+        # цикл) — join() с таймаутом дожидается, пока он реально выйдет и
+        # оставит стик в нуле, а не завершает InputManager, пока фоновый
+        # поток ещё жив.
+        self._aim_worker_thread.join(timeout=1.0)
+        with self._gamepad_lock:
+            self._gamepad.reset()
+            self._gamepad.update()
         logger.debug("InputManager остановлен штатно.")
 
     def wait_idle(self) -> None:
@@ -452,10 +610,11 @@ class InputManager:
                 try:
                     if cmd[0] == "press_button":
                         self._do_press_button(cmd[1])
-                    elif cmd[0] == "aim_with_stick":
-                        self._do_aim_with_stick(cmd[1], cmd[2])
                     elif cmd[0] == "execute_combo":
                         self._do_execute_combo(cmd[1])
+                    # aim_with_stick БОЛЬШЕ НЕ команда этой очереди — см.
+                    # докстринг модуля и aim_with_stick(): камера живёт в
+                    # отдельном _aim_worker, не через queue.Queue.
                 except Exception as e:
                     logger.error("InputManager: ошибка выполнения команды: %s", e)
 
@@ -540,88 +699,36 @@ class InputManager:
         gamepad_debug_logger.debug(
             "PRESS   одиночная кнопка %s (action='%s')", button, action
         )
-        self._gamepad.press_button(button=button)
-        self._gamepad.update()
+        # Под _gamepad_lock — см. докстринг класса: _aim_worker может в
+        # любой момент писать в тот же self._gamepad параллельно.
+        with self._gamepad_lock:
+            self._gamepad.press_button(button=button)
+            self._gamepad.update()
 
         self._interruptible_sleep(hold_s)
 
         # Отпускаем БЕЗУСЛОВНО, даже если удержание было прервано паникой —
         # тот же принцип, что раньше был с key_up/mouse_up: застрявшая
         # нажатой кнопка геймпада эквивалентна залипшей клавише в игре.
-        self._gamepad.release_button(button=button)
-        self._gamepad.update()
+        with self._gamepad_lock:
+            self._gamepad.release_button(button=button)
+            self._gamepad.update()
         gamepad_debug_logger.debug(
             "        (одиночная кнопка %s отпущена, держали %.0f мс)",
             button, hold_s * 1000,
         )
 
-    def _do_aim_with_stick(self, dx: float, dy: float) -> None:
-        # Нормализуем пиксельное смещение в силу отклонения [-1.0, 1.0].
-        # Используем float-API vgamepad (right_joystick_float), а не
-        # сырые int16 (-32768..32767) — так не нужно вручную считать
-        # округления, и код читается как "доля от максимума", а не как
-        # магическое число из непонятного диапазона.
-        target_x = self._offset_to_stick_force(dx)
-        # offset_y в системе координат экрана растёт ВНИЗ, а "+1" на
-        # стике обычно означает "вверх/от себя" — инвертируем, иначе
-        # камера будет доворачиваться по вертикали в обратную сторону.
-        target_y = -self._offset_to_stick_force(dy)
-
-        steps = random.randint(*self._AIM_RAMP_STEPS)
-        ramp_s = random.uniform(*self._AIM_RAMP_MS) / 1000.0
-        step_s = ramp_s / steps
-
-        # --- Разгон: плавно доводим стик от нуля до целевой силы по
-        # smoothstep-кривой, а не одним скачком. ---
-        aborted = False
-        for i in range(1, steps + 1):
-            eased = _smoothstep(i / steps)
-            self._gamepad.right_joystick_float(
-                x_value_float=target_x * eased, y_value_float=target_y * eased
-            )
+    def _set_stick(self, x: float, y: float) -> None:
+        """
+        Один шаг стика: выставить силу + update(), под общим
+        _gamepad_lock — вызывается КАЖДЫЙ тик из _aim_worker (50Гц), а
+        также нулём из halt_immediately()/stop(). Вынесен отдельным
+        методом, а не дублирован в трёх местах — одна точка, где
+        "выставить стик" физически касается self._gamepad.
+        """
+        with self._gamepad_lock:
+            self._gamepad.right_joystick_float(x_value_float=x, y_value_float=y)
             self._gamepad.update()
-            if not self._interruptible_sleep(step_s):
-                aborted = True
-                break
-
-        # --- Удержание на пике с микро-дрожанием — см. _AIM_JITTER_*. ---
-        if not aborted:
-            hold_s = random.uniform(*self._AIM_HOLD_MS) / 1000.0
-            ticks = random.randint(*self._AIM_JITTER_TICKS)
-            tick_s = hold_s / ticks
-            for _ in range(ticks):
-                jitter_x = random.uniform(-self._AIM_JITTER_AMOUNT, self._AIM_JITTER_AMOUNT)
-                jitter_y = random.uniform(-self._AIM_JITTER_AMOUNT, self._AIM_JITTER_AMOUNT)
-                self._gamepad.right_joystick_float(
-                    x_value_float=max(-1.0, min(1.0, target_x + jitter_x)),
-                    y_value_float=max(-1.0, min(1.0, target_y + jitter_y)),
-                )
-                self._gamepad.update()
-                if not self._interruptible_sleep(tick_s):
-                    aborted = True
-                    break
-
-        # Если прервано паникой — сразу в ноль, тут важна скорость
-        # реакции на F4, а не реализм торможения.
-        if aborted:
-            self._gamepad.right_joystick_float(x_value_float=0.0, y_value_float=0.0)
-            self._gamepad.update()
-            return
-
-        # --- Торможение: симметричный плавный возврат в центр. ---
-        for i in range(1, steps + 1):
-            eased = _smoothstep(i / steps)
-            self._gamepad.right_joystick_float(
-                x_value_float=target_x * (1 - eased), y_value_float=target_y * (1 - eased)
-            )
-            self._gamepad.update()
-            if not self._interruptible_sleep(step_s):
-                break
-
-        # Финальная страховка: ровно ноль, независимо от накопленной
-        # погрешности округления в шагах разгона/торможения выше.
-        self._gamepad.right_joystick_float(x_value_float=0.0, y_value_float=0.0)
-        self._gamepad.update()
 
     def _do_execute_combo(self, actions: list[str]) -> None:
         # Кнопки-модификаторы (RB/LB), которые этот вызов ЗАЖАЛ через
@@ -641,13 +748,15 @@ class InputManager:
             verb, _, target = action.partition("_")
 
             if verb == "hold" and target in self._TRIGGER_SETTERS:
-                getattr(self._gamepad, self._TRIGGER_SETTERS[target])(value_float=1.0)
-                self._gamepad.update()
+                with self._gamepad_lock:
+                    getattr(self._gamepad, self._TRIGGER_SETTERS[target])(value_float=1.0)
+                    self._gamepad.update()
                 gamepad_debug_logger.debug("HOLD    курок %s", target)
 
             elif verb == "release" and target in self._TRIGGER_SETTERS:
-                getattr(self._gamepad, self._TRIGGER_SETTERS[target])(value_float=0.0)
-                self._gamepad.update()
+                with self._gamepad_lock:
+                    getattr(self._gamepad, self._TRIGGER_SETTERS[target])(value_float=0.0)
+                    self._gamepad.update()
                 gamepad_debug_logger.debug("RELEASE курок %s", target)
 
             elif verb == "hold" and target in self.BUTTON_MAP:
@@ -656,22 +765,25 @@ class InputManager:
                 # пока не встретится её собственный "release_" шаг (или
                 # пока не сработает страховка в конце метода).
                 button = self.BUTTON_MAP[target]
-                self._gamepad.press_button(button=button)
-                self._gamepad.update()
+                with self._gamepad_lock:
+                    self._gamepad.press_button(button=button)
+                    self._gamepad.update()
                 held_buttons.add(button)
                 gamepad_debug_logger.debug("HOLD    кнопка-модификатор %s", target)
 
             elif verb == "release" and target in self.BUTTON_MAP:
                 button = self.BUTTON_MAP[target]
-                self._gamepad.release_button(button=button)
-                self._gamepad.update()
+                with self._gamepad_lock:
+                    self._gamepad.release_button(button=button)
+                    self._gamepad.update()
                 held_buttons.discard(button)
                 gamepad_debug_logger.debug("RELEASE кнопка-модификатор %s", target)
 
             elif verb == "press" and target in self.BUTTON_MAP:
                 button = self.BUTTON_MAP[target]
-                self._gamepad.press_button(button=button)
-                self._gamepad.update()
+                with self._gamepad_lock:
+                    self._gamepad.press_button(button=button)
+                    self._gamepad.update()
                 gamepad_debug_logger.debug("PRESS   кнопка %s (down)", target)
                 # Удержание кнопки внутри комбо — та же случайная
                 # длительность, что и у одиночного press_button, чтобы
@@ -679,8 +791,9 @@ class InputManager:
                 hold_s = random.uniform(*self._HOLD_BUTTON_MS) / 1000.0
                 gamepad_debug_logger.debug("        (держим %s %.0f мс)", target, hold_s * 1000)
                 self._interruptible_sleep(hold_s)
-                self._gamepad.release_button(button=button)
-                self._gamepad.update()
+                with self._gamepad_lock:
+                    self._gamepad.release_button(button=button)
+                    self._gamepad.update()
                 gamepad_debug_logger.debug("PRESS   кнопка %s (up)", target)
 
             else:
@@ -706,21 +819,149 @@ class InputManager:
         # остального: в игре это обычно переключатель режима, который
         # будет менять смысл ЛЮБОГО следующего нажатия, пока кто-то не
         # заметит и не перезапустит бота вручную.
-        for button in held_buttons:
-            self._gamepad.release_button(button=button)
-            gamepad_debug_logger.debug("SAFETY  отпускаю зависшую кнопку %s", button)
-        self._gamepad.left_trigger_float(value_float=0.0)
-        self._gamepad.right_trigger_float(value_float=0.0)
-        self._gamepad.update()
+        with self._gamepad_lock:
+            for button in held_buttons:
+                self._gamepad.release_button(button=button)
+                gamepad_debug_logger.debug("SAFETY  отпускаю зависшую кнопку %s", button)
+            self._gamepad.left_trigger_float(value_float=0.0)
+            self._gamepad.right_trigger_float(value_float=0.0)
+            self._gamepad.update()
         gamepad_debug_logger.debug("=== COMBO END ===")
 
-    def _offset_to_stick_force(self, offset_px: float) -> float:
-        """Пиксельное смещение -> сила отклонения стика в диапазоне [-1.0, 1.0]."""
-        if offset_px == 0:
-            return 0.0
-        magnitude = min(abs(offset_px) / self._AIM_MAX_OFFSET_PX, 1.0)
-        magnitude = max(magnitude, self._AIM_MIN_FORCE)
-        return magnitude if offset_px > 0 else -magnitude
+    def _read_aim_target(self) -> "tuple[float, float, bool]":
+        """
+        Текущее содержимое почтового ящика цели, под _aim_lock. Дёшево —
+        просто копия двух float и bool.
+
+        engaged — это НЕ "офсет вне дедзоны сейчас", а "жив ли вообще
+        захват цели" (True с момента aim_with_stick(), False только после
+        clear_aim_target()/halt_immediately()). Раздельно с дедзоной
+        специально: у реально удерживаемой цели офсет из-за шума детекции
+        постоянно чуть колеблется вокруг центра и то входит в дедзону, то
+        выходит — если гасить тремор по дедзоне, он будет мигать туда-сюда
+        каждый раз, когда офсет случайно пересекает границу, и выглядеть
+        как рандомный дёрганый шум, а не как ровное покачивание вокруг
+        цели. engaged фильтрует именно "цель вообще есть", а не "цель
+        сейчас точно по центру".
+        """
+        with self._aim_lock:
+            return self._aim_dx, self._aim_dy, self._aim_engaged
+
+    def _aim_worker(self) -> None:
+        """
+        НЕПРЕРЫВНЫЙ цикл доворота камеры — работает всё время жизни
+        InputManager, независимо от очереди кнопок/комбо (_worker).
+
+        Модель v2 — "спринг + тремор" вместо дискретных доводов:
+        каждый тик (_AIM_TICK_S) вычисляем, куда СЕЙЧАС тянет стик текущая
+        цель (_aim_curve — плавная кривая offset -> сила, БЕЗ жёсткого
+        порога минимальной силы старой версии, который и давал тот самый
+        "рывок" при пересечении дедзоны), и экспоненциально подтягиваем
+        туда ТЕКУЩЕЕ положение стика (RC-фильтр с постоянной времени tau,
+        см. _AIM_SMOOTH_TIME_S) — сама эта постоянная времени и создаёт
+        задержку реакции и плавность, отдельные фазы разгона/торможения
+        не нужны. Поверх накладывается процесс Орнштейна-Уленбека
+        (_ou_step) — небольшое ограниченное случайное блуждание, которое
+        и есть "прицел ходит туда-сюда вокруг цели", а не стоит мёртво на
+        0.0 между коррекциями.
+
+        tau периодически (_AIM_TAU_REROLL_S) перевыбирается заново —
+        "собранность" реального игрока не идеально константна весь бой.
+
+        Почему не queue.Queue, как у кнопок: очередь копила бы ИСТОРИЮ
+        офсетов и выполняла их один за другим с опозданием, если поток
+        занят текущей коррекцией — то есть ровно та проблема "довoрот по
+        устаревшим координатам", из-за которой этот поток вообще
+        появился. Здесь вместо истории — только "последнее известное
+        значение", перечитываемое на каждом тике.
+
+        Логирование (gamepad_debug_logger, тот же файл/стиль, что у
+        COMBO/PRESS): пишем ТОЛЬКО смену состояния (покой -> слежение и
+        обратно), а не каждый тик — при _AIM_TICK_S=20мс логирование
+        каждого тика раздуло бы файл до нечитаемого состояния за секунды.
+        """
+        # Состояние привода — ЛОКАЛЬНЫЕ переменные, а не self.*: их читает
+        # и пишет ТОЛЬКО этот поток, ни кнопочный _worker, ни FSM извне к
+        # ним не обращаются, поэтому никакого лока для них не нужно (в
+        # отличие от self._aim_dx/dy, которые пишет FSM-поток, а читает
+        # этот — та граница между потоками и защищена _aim_lock).
+        stick_x = stick_y = 0.0
+        tremor_x = tremor_y = 0.0
+
+        tau = random.uniform(*self._AIM_SMOOTH_TIME_S)
+        next_tau_reroll_at = time.monotonic() + random.uniform(*self._AIM_TAU_REROLL_S)
+
+        was_idle = True  # старт в покое, лог перехода на первом тике не нужен
+        while self._running:
+            now = time.monotonic()
+            if now >= next_tau_reroll_at:
+                tau = random.uniform(*self._AIM_SMOOTH_TIME_S)
+                next_tau_reroll_at = now + random.uniform(*self._AIM_TAU_REROLL_S)
+
+            dx, dy, engaged = self._read_aim_target()
+            desired_x = _aim_curve(
+                dx, self._AIM_MAX_OFFSET_PX, self._AIM_DEADZONE_PX, self._AIM_CURVE_EXPONENT
+            )
+            # offset_y в системе координат экрана растёт ВНИЗ, а "+1" на
+            # стике обычно означает "вверх/от себя" — инвертируем, иначе
+            # камера доворачивалась бы по вертикали в обратную сторону.
+            desired_y = -_aim_curve(
+                dy, self._AIM_MAX_OFFSET_PX, self._AIM_DEADZONE_PX, self._AIM_CURVE_EXPONENT
+            )
+
+            in_deadzone = desired_x == 0.0 and desired_y == 0.0
+            if in_deadzone and not was_idle:
+                gamepad_debug_logger.debug("AIM     цель в дедзоне/потеряна -> ухожу в покой")
+                was_idle = True
+            elif not in_deadzone and was_idle:
+                gamepad_debug_logger.debug(
+                    "AIM     цель вне дедзоны -> начинаю слежение dx=%+.1f dy=%+.1f", dx, dy
+                )
+                was_idle = False
+
+            dt = self._AIM_TICK_S
+            # Экспоненциальное приближение к желаемой силе — стандартная
+            # дискретизация RC-фильтра/критически задемпфированной
+            # пружины: alpha=1 держал бы стик мгновенно "телепортирующимся"
+            # к цели (как в v1 после разгона), alpha->0 — почти не двигался
+            # бы вовсе. Формула через exp(), а не просто "шаг / tau", даёт
+            # корректное поведение независимо от того, насколько мелкий dt.
+            alpha = 1.0 - math.exp(-dt / tau)
+            stick_x += (desired_x - stick_x) * alpha
+            stick_y += (desired_y - stick_y) * alpha
+
+            # Тремор — ТОЛЬКО пока цель реально захвачена (engaged), а НЕ
+            # "офсет прямо сейчас вне дедзоны". Это две разные вещи:
+            # дедзона — мгновенный статус конкретного кадра, engaged —
+            # состояние "идёт бой с целью" на всём протяжении удержания.
+            # У хорошо удерживаемой цели офсет из-за шума детекции сам по
+            # себе постоянно чуть гуляет вокруг центра ROI и то ныряет в
+            # дедзону, то выныривает — если бы тремор гасился по дедзоне
+            # (старая версия), он бы мигал вкл/выкл на каждом таком
+            # пересечении границы, и это и выглядело как "рандомные
+            # движения не по центру цели", а не как ровное покачивание.
+            # Раньше тремор считался каждый тик БЕЗУСЛОВНО, с момента
+            # создания InputManager — камера тряслась даже когда цели
+            # вообще ещё не было (SEARCH, F6-тест без vision и т.п.).
+            # Итог: тремор идёт непрерывно весь бой, пока цель захвачена,
+            # и полностью выключен, когда цели нет вовсе.
+            if engaged:
+                tremor_x = _ou_step(tremor_x, self._AIM_TREMOR_THETA, self._AIM_TREMOR_SIGMA, dt)
+                tremor_y = _ou_step(tremor_y, self._AIM_TREMOR_THETA, self._AIM_TREMOR_SIGMA, dt)
+            else:
+                tremor_x = tremor_y = 0.0
+
+            out_x = max(-1.0, min(1.0, stick_x + tremor_x))
+            out_y = max(-1.0, min(1.0, stick_y + tremor_y))
+            self._set_stick(out_x, out_y)
+
+            if not self._interruptible_sleep(dt):
+                break
+
+        # Страховка на выходе — независимо от причины остановки цикла
+        # (обычный stop() или halt_immediately()), стик должен остаться
+        # ровно в нуле, а не в последнем случайном положении тремора.
+        self._set_stick(0.0, 0.0)
 
 
 if __name__ == "__main__":
@@ -741,6 +982,12 @@ if __name__ == "__main__":
     except ValueError as e:
         print("Тест: parse_combo_string('RB+LB+A') корректно упал с ошибкой:", e)
 
+    # Тест _aim_curve/_ou_step как чистых функций — без геймпада вообще,
+    # проверяем саму математику до похода в игру.
+    print("Тест: _aim_curve(0, 150, 18, 0.45) =", _aim_curve(0, 150, 18, 0.45), "(в дедзоне -> 0)")
+    print("Тест: _aim_curve(150, 150, 18, 0.45) =", _aim_curve(150, 150, 18, 0.45), "(максимум -> ~1.0)")
+    print("Тест: _aim_curve(-40, 150, 18, 0.45) =", _aim_curve(-40, 150, 18, 0.45), "(отрицательный offset)")
+
     im = InputManager()
     print("Виртуальный геймпад создан. Открой joy.cpl и посмотри на устройство.")
     time.sleep(2)
@@ -749,12 +996,16 @@ if __name__ == "__main__":
     im.press_button("attack")
     time.sleep(0.5)
 
-    print("Тест: aim_with_stick(+100, 0) — доворот вправо")
-    im.aim_with_stick(100, 0)
-    time.sleep(0.5)
+    print("Тест: aim_with_stick — непрерывное слежение по синусоиде 3 секунды")
+    print("(фоновый _aim_worker сам сглаживает и добавляет тремор — смотри стик в joy.cpl)")
+    start = time.time()
+    while time.time() - start < 3.0:
+        t = time.time() - start
+        im.aim_with_stick(120.0 * math.sin(t * 2), 0.0)
+        time.sleep(1 / 60)
 
-    print("Тест: aim_with_stick(0, -80) — доворот вверх (offset_y отрицательный)")
-    im.aim_with_stick(0, -80)
+    print("Тест: clear_aim_target() — стик должен уйти в покой")
+    im.clear_aim_target()
     time.sleep(0.5)
 
     print("Тест: execute_combo(['hold_LT', 'press_X', 'release_LT'])")
