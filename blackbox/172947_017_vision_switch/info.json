@@ -1,0 +1,18 @@
+{
+ "state": "COMBAT",
+ "phase": "APPROACH",
+ "engaged": false,
+ "since_entry_s": 4.75,
+ "chain": null,
+ "panel_found": true,
+ "hp": 98.56,
+ "txt": "HpText(sig=782c400c, ink=114, 10x98)",
+ "waited_s": 4.75,
+ "bar": [
+  1064,
+  475,
+  88,
+  5
+ ],
+ "event": "vision_switch"
+}

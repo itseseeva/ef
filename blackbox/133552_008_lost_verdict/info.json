@@ -1,0 +1,16 @@
+{
+ "state": "COMBAT",
+ "phase": "REACQUIRE",
+ "engaged": true,
+ "since_entry_s": 14.48,
+ "chain": "Цепочка #3",
+ "panel_found": false,
+ "hp": 0.0,
+ "txt": "None",
+ "verdict": "killed",
+ "last_hp": 28.78,
+ "rate": 10.969999999999999,
+ "projected": 16.098679999810997,
+ "missing_for_s": 1.0150000000139698,
+ "event": "lost_verdict"
+}

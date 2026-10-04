@@ -1,238 +1,52 @@
 {
-  "_README": "Конфигурация умений, слотов и боевых цепочек ротации для Throne and Liberty.",
-  "exportDate": "2026-10-02T05:26:26.934Z",
-  "totalSlots": 12,
-  "topGridSkillIds": [
-    "skill_1",
-    "skill_15",
-    "skill_10",
-    null,
-    "skill_2",
-    null,
-    null,
-    "skill_8",
-    null,
-    "skill_14",
-    null,
-    "skill_12",
-    "skill_17",
-    null,
-    "skill_3",
-    null,
-    null,
-    null,
-    "skill_19",
-    null,
-    null,
-    "skill_22",
-    "skill_23",
-    null
-  ],
-  "hotkeySlots": [
-    {
-      "slot": "1",
-      "slotIndex": 1,
-      "combo": "RB+X",
-      "skillId": "skill_9",
-      "skillName": "Прорыв ветра"
-    },
-    {
-      "slot": "2",
-      "slotIndex": 2,
-      "combo": "RB+Y",
-      "skillId": "skill_4",
-      "skillName": "Множественный выстрел"
-    },
-    {
-      "slot": "3",
-      "slotIndex": 3,
-      "combo": "RB+B",
-      "skillId": "skill_24",
-      "skillName": "Цепная молния"
-    },
-    {
-      "slot": "4",
-      "slotIndex": 4,
-      "combo": "RB+A",
-      "skillId": "skill_11",
-      "skillName": "Точный выстрел"
-    },
-    {
-      "slot": "5",
-      "slotIndex": 5,
-      "combo": "RT+X",
-      "skillId": "skill_18",
-      "skillName": "Морозная завеса"
-    },
-    {
-      "slot": "6",
-      "slotIndex": 6,
-      "combo": "RT+Y",
-      "skillId": "skill_7",
-      "skillName": "Очистительное прикосновение"
-    },
-    {
-      "slot": "7",
-      "slotIndex": 7,
-      "combo": "RT+B",
-      "skillId": "skill_13",
-      "skillName": "Внутренний покой"
-    },
-    {
-      "slot": "8",
-      "slotIndex": 8,
-      "combo": "RT+A",
-      "skillId": "skill_6",
-      "skillName": "Опутывающая стрела"
-    },
-    {
-      "slot": "9",
-      "slotIndex": 9,
-      "combo": "RT+DPAD_LEFT",
-      "skillId": "skill_21",
-      "skillName": "Пылающий разлом"
-    },
-    {
-      "slot": "0",
-      "slotIndex": 10,
-      "combo": "RT+DPAD_UP",
-      "skillId": "skill_20",
-      "skillName": "Огненные заряды"
-    },
-    {
-      "slot": "-",
-      "slotIndex": 11,
-      "combo": "RT+DPAD_RIGHT",
-      "skillId": "skill_5",
-      "skillName": "Навесная стрела"
-    },
-    {
-      "slot": "=",
-      "slotIndex": 12,
-      "combo": "RT+DPAD_DOWN",
-      "skillId": "skill_16",
-      "skillName": "Ледяное копьё"
-    }
-  ],
-  "totalChains": 3,
+  "_README": "Конфигурация клавиатурных комбинаций и цепочек ротации для Throne and Liberty.",
+  "exportDate": "2026-10-04T13:32:40.868Z",
+  "mode": "keyboard",
+  "totalChains": 1,
   "chains": [
     {
-      "id": "chain_1",
-      "name": "Цепочка #1 (Основная)",
+      "id": "chain_1791037827598",
+      "name": "Цепочка #2",
       "order": 1,
       "triggerAfter": "start",
-      "cooldownSeconds": 20,
+      "cooldownSeconds": 8,
       "stepsCount": 4,
       "steps": [
         {
           "stepIndex": 1,
-          "skillId": "skill_4",
-          "skillName": "Множественный выстрел",
-          "slot": "2",
-          "combo": "RB+Y",
-          "repeatCount": 3,
+          "key": "1",
+          "slot": "1",
+          "combo": "1",
+          "skillName": "Key_1",
+          "repeatCount": 1,
           "castTimeSeconds": 0
         },
         {
           "stepIndex": 2,
-          "skillId": "skill_9",
-          "skillName": "Прорыв ветра",
-          "slot": "1",
-          "combo": "RB+X",
+          "key": "2",
+          "slot": "2",
+          "combo": "2",
+          "skillName": "Key_2",
           "repeatCount": 1,
           "castTimeSeconds": 0
         },
         {
           "stepIndex": 3,
-          "skillId": "skill_24",
-          "skillName": "Цепная молния",
+          "key": "3",
           "slot": "3",
-          "combo": "RB+B",
+          "combo": "3",
+          "skillName": "Key_3",
           "repeatCount": 1,
           "castTimeSeconds": 0
         },
         {
           "stepIndex": 4,
-          "skillId": "skill_16",
-          "skillName": "Ледяное копьё",
-          "slot": "=",
-          "combo": "RT+DPAD_DOWN",
-          "repeatCount": 1,
-          "castTimeSeconds": 0
-        }
-      ]
-    },
-    {
-      "id": "chain_1790529846259",
-      "name": "Цепочка #2",
-      "order": 2,
-      "triggerAfter": "chain_1",
-      "cooldownSeconds": 20,
-      "stepsCount": 3,
-      "steps": [
-        {
-          "stepIndex": 1,
-          "skillId": "skill_7",
-          "skillName": "Очистительное прикосновение",
-          "slot": "6",
-          "combo": "RT+Y",
-          "repeatCount": 1,
-          "castTimeSeconds": 0
-        },
-        {
-          "stepIndex": 2,
-          "skillId": "skill_13",
-          "skillName": "Внутренний покой",
-          "slot": "7",
-          "combo": "RT+B",
-          "repeatCount": 1,
-          "castTimeSeconds": 5
-        },
-        {
-          "stepIndex": 3,
-          "skillId": "skill_11",
-          "skillName": "Точный выстрел",
+          "key": "4",
           "slot": "4",
-          "combo": "RB+A",
+          "combo": "4",
+          "skillName": "Key_4",
           "repeatCount": 1,
           "castTimeSeconds": 0
-        }
-      ]
-    },
-    {
-      "id": "chain_1790573145734",
-      "name": "Цепочка #3",
-      "order": 3,
-      "triggerAfter": "chain_1790529846259",
-      "cooldownSeconds": 15,
-      "stepsCount": 3,
-      "steps": [
-        {
-          "stepIndex": 1,
-          "skillId": "skill_5",
-          "skillName": "Навесная стрела",
-          "slot": "-",
-          "combo": "RT+DPAD_RIGHT",
-          "repeatCount": 2,
-          "castTimeSeconds": 0
-        },
-        {
-          "stepIndex": 2,
-          "skillId": "skill_21",
-          "skillName": "Пылающий разлом",
-          "slot": "9",
-          "combo": "RT+DPAD_LEFT",
-          "repeatCount": 1,
-          "castTimeSeconds": 0
-        },
-        {
-          "stepIndex": 3,
-          "skillId": "skill_20",
-          "skillName": "Огненные заряды",
-          "slot": "0",
-          "combo": "RT+DPAD_UP",
-          "repeatCount": 2,
-          "castTimeSeconds": 2
         }
       ]
     }

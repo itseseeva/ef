@@ -1,0 +1,12 @@
+{
+ "state": "SEARCH",
+ "phase": "APPROACH",
+ "engaged": false,
+ "since_entry_s": 1.72,
+ "chain": null,
+ "panel_found": true,
+ "hp": 68.18,
+ "txt": "HpText(sig=a3df7733, ink=169, 10x93)",
+ "reason": "нет бежевой окантовки снизу",
+ "event": "panel_miss_beige"
+}

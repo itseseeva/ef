@@ -1,0 +1,13 @@
+{
+ "state": "COMBAT",
+ "phase": "REACQUIRE",
+ "engaged": true,
+ "since_entry_s": 6.98,
+ "chain": null,
+ "panel_found": true,
+ "hp": 92.81,
+ "txt": "HpText(sig=1c6d2eaa, ink=113, 10x98)",
+ "why": "свой Tab",
+ "waited_s": 2.0310000000172295,
+ "event": "click_skipped"
+}

@@ -1,0 +1,16 @@
+{
+ "state": "COMBAT",
+ "phase": "APPROACH",
+ "engaged": true,
+ "since_entry_s": 4.16,
+ "chain": null,
+ "panel_found": false,
+ "hp": 0.0,
+ "txt": "None",
+ "verdict": "killed",
+ "last_hp": 32.26,
+ "rate": 26.276183086687134,
+ "projected": 0.0,
+ "missing_for_s": 1.5310000000754371,
+ "event": "lost_verdict"
+}

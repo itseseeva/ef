@@ -1,0 +1,16 @@
+{
+ "state": "COMBAT",
+ "phase": "TAB",
+ "engaged": true,
+ "since_entry_s": 2.69,
+ "chain": "Цепочка #1 (Основная)",
+ "panel_found": false,
+ "hp": 0.0,
+ "txt": "None",
+ "verdict": "killed",
+ "last_hp": 28.06,
+ "rate": 3.3533333333333366,
+ "projected": 24.076239999920357,
+ "missing_for_s": 1.047000000020489,
+ "event": "lost_verdict"
+}

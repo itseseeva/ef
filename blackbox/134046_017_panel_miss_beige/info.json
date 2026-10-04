@@ -1,0 +1,12 @@
+{
+ "state": "COMBAT",
+ "phase": "TAB",
+ "engaged": false,
+ "since_entry_s": 96.91,
+ "chain": "Цепочка #3",
+ "panel_found": true,
+ "hp": 100.0,
+ "txt": "HpText(sig=61d2a451, ink=113, 10x96)",
+ "reason": "нет бежевой окантовки снизу",
+ "event": "panel_miss_beige"
+}

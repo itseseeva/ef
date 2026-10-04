@@ -1,4 +1,4 @@
-"""
+﻿"""
 app_launcher.py
 
 Мост между React-интерфейсом (EasyFarm Bot Suite, папка dist/ после
@@ -298,25 +298,9 @@ class Api:
             logger.exception("start_bot: не удалось инициализировать FarmBot.")
             return {"ok": False, "error": str(e)}
 
-        # "Жертвенный" холостой повтор ПЕРВОГО скилла первой цепочки — ДО
-        # запуска реального FSM-потока. Голый тап атаки (более ранняя
-        # версия этой правки) не спасал; спасает именно повтор РЕАЛЬНОГО
-        # комбо первого скилла (hold_модификатор -> press -> release),
-        # подтверждено вручную через F6-тест. Причина, по всей видимости,
-        # в том, что игре/движку нужно один раз увидеть именно удержание
-        # модификатора, чтобы включить распознавание комбо-инпута — точный
-        # механизм лежит в закрытом коде игры/ViGEmBus, копать дальше туда
-        # нецелесообразно (см. обсуждение), поэтому фиксируем рабочий
-        # обходной путь, а не тратим время на поиск первопричины внутри
-        # чужого закрытого кода.
-        chains_for_warmup = self._bot._chains
-        if chains_for_warmup and chains_for_warmup[0]["gamepad_steps"]:
-            warmup_steps = chains_for_warmup[0]["gamepad_steps"][0]
-            logger.info(
-                "start_bot: холостой повтор первого скилла (антипотеря первого каста)."
-            )
-            self._bot.input_manager.execute_combo(warmup_steps)
-            self._bot.input_manager.wait_idle()
+        # (Холостой повтор первого скилла при Старте убран 2026-10-03 по просьбе
+        # пользователя: это была заплатка от виртуального геймпада — клавиатуре
+        # она не нужна, а скилл зря уходил в откат ещё до боя.)
 
         self._bot_thread = threading.Thread(
             target=self._bot.run, daemon=True, name="FarmBotLoop"
@@ -357,10 +341,28 @@ class Api:
             os.makedirs(os.path.dirname(_CONFIG_PATH), exist_ok=True)
             with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
                 f.write(config_json)
-            return {"ok": True}
         except Exception as e:
             logger.exception("save_config: ошибка записи файла.")
             return {"ok": False, "error": str(e)}
+        self._reload_running_bot()
+        return {"ok": True}
+
+    def _reload_running_bot(self) -> None:
+        """
+        Моментальное применение (2026-10-03): бот уже работает -> отдаём ему
+        свежие цепочки сразу после сохранения, без Стоп/Старт. Интерфейс
+        сохраняет через ~0.6 с после правки, бот подхватывает на следующем
+        тике. Ошибка разбора не роняет сохранение: файл уже на диске, бот
+        просто продолжает со старыми цепочками (в логе — причина).
+        """
+        bot = self._bot
+        if bot is None or self._bot_thread is None or not self._bot_thread.is_alive():
+            return                     # бот не запущен — конфиг прочитает start_bot()
+        try:
+            bot.request_chains_reload(load_skills_config(_CONFIG_PATH))
+            logger.info("save_config: цепочки применены к работающему боту.")
+        except Exception:
+            logger.exception("save_config: не смог применить цепочки на лету.")
 
     def load_config(self) -> dict:
         """
@@ -491,25 +493,8 @@ class Api:
                 self._test_input_manager = InputManager()
             input_manager = self._test_input_manager
 
-            # ВРЕМЕННО (диагностика v2): проверяем гипотезу ТОЧНЕЕ, чем
-            # раньше — не "нужно ли вообще какое-то нажатие" (голый тап
-            # attack это уже не спас), а "нужно ли игре хотя бы раз увидеть
-            # именно УДЕРЖАНИЕ RB/RT как у настоящего скилла" (hold -> press
-            # -> release), а не одиночный тап. Поэтому холостой прогон —
-            # это НЕ press_button("attack"), а РЕАЛЬНЫЙ combo первого скилла
-            # первой цепочки, просто выполненный на один раз больше и с
-            # отброшенным результатом. Если ПОСЛЕ него настоящий первый
-            # скилл штатного прохода сработает — значит, дело именно в
-            # распознавании удержания модификатора, а не в общей "прогретости"
-            # устройства или общем количестве прошедшего времени.
-            if chains and chains[0]["gamepad_steps"]:
-                warmup_steps = chains[0]["gamepad_steps"][0]
-                gamepad_debug_logger.debug(
-                    "########## WARMUP (холостой повтор первого скилла: %s) ##########",
-                    warmup_steps,
-                )
-                input_manager.execute_combo(warmup_steps)
-                input_manager.wait_idle()
+            # (Холостой WARMUP первого скилла убран 2026-10-03 вместе с таким же в
+            # start_bot: заплатка от геймпада, F6 жал первый скилл дважды.)
 
             # ПОЛНОЦЕННЫЙ тест ротации: та же самая боевая
             # _act_combat_rotation() (см. bot.py) — не копия её логики, а
@@ -643,8 +628,8 @@ def main() -> None:
         "EasyFarm — Throne and Liberty",
         _DIST_INDEX,
         js_api=api,
-        width=560,
-        height=700,
+        width=530,
+        height=320,
     )
 
     # os._exit() — жёсткий выход из процесса в обход обычной Python-очистки

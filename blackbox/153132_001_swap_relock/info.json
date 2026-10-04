@@ -1,0 +1,12 @@
+{
+ "state": "COMBAT",
+ "phase": "APPROACH",
+ "engaged": false,
+ "since_entry_s": 0.0,
+ "chain": "Цепочка #1 (Основная)",
+ "panel_found": true,
+ "hp": 94.96,
+ "txt": "HpText(sig=5baff573, ink=126, 10x98)",
+ "why": "панель пропадала 0.75с и вернулась",
+ "event": "swap_relock"
+}

@@ -1,0 +1,14 @@
+{
+ "state": "COMBAT",
+ "phase": "APPROACH",
+ "engaged": false,
+ "since_entry_s": 2.03,
+ "chain": "Цепочка #1 (Основная)",
+ "panel_found": true,
+ "hp": 94.96,
+ "txt": "HpText(sig=5baff573, ink=126, 10x98)",
+ "why": "смена цели игрой",
+ "waited_s": 2.0310000000172295,
+ "under": "other",
+ "event": "click_skipped"
+}

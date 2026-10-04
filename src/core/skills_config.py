@@ -65,7 +65,7 @@ import logging
 # только когда его импортируют как часть пакета src.core.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
-from src.core.input_manager import InputManager
+from src.core.input_manager import InputManager, input_debug_logger
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +92,48 @@ logger = logging.getLogger(__name__)
 _DEFAULT_CAST_TIME_BY_SKILL_ID: dict[str, float] = {
     "skill_13": 5.0,  # "Внутренний покой" (Staff) — долгий канал
 }
+
+
+def _order_by_trigger(raw_chains: "list[dict]") -> "list[dict]":
+    """
+    Порядок цепочек как в поле "Пуск" приложения (2026-10-03): сначала та, что
+    "со старта", потом та, что "после неё", и так далее. Раньше бот смотрел
+    только на "order" (место в списке), и "Пуск: После Цепочка #2" сохранялся
+    в файл, но на ротацию не влиял.
+
+    Обход в глубину от "start": дети узла X — цепочки с triggerAfter == X (между
+    собой — по "order"). Ссылка на несуществующую цепочку = "со старта". Цепочки,
+    до которых от старта не дойти (зациклили: #1 после #2, #2 после #1), идут
+    в конец по "order" — бот не теряет ни одной.
+    Как проверить без игры: python src/core/skills_config.py путь_к_json —
+    печатает цепочки в итоговом порядке.
+    """
+    by_order = sorted(raw_chains, key=lambda c: c.get("order", 0))
+    ids = {c.get("id") for c in by_order}
+    children: "dict[str, list[dict]]" = {}
+    for c in by_order:
+        parent = c.get("triggerAfter") or "start"
+        if parent != "start" and parent not in ids:
+            parent = "start"
+        children.setdefault(parent, []).append(c)
+
+    result: "list[dict]" = []
+    seen: "set[int]" = set()          # id() объекта: у цепочки может не быть поля "id"
+    stack = list(reversed(children.get("start", [])))
+    while stack:                       # явный стек вместо рекурсии — цикл в данных её не уронит
+        c = stack.pop()
+        if id(c) in seen:
+            continue
+        seen.add(id(c))
+        result.append(c)
+        stack.extend(reversed(children.get(c.get("id"), [])))
+    rest = [c for c in by_order if id(c) not in seen]
+    if rest:
+        logger.warning(
+            "Цепочки %s не связаны со стартом (поле 'Пуск' зациклено?) — ставлю в конец.",
+            [c.get("name") for c in rest],
+        )
+    return result + rest
 
 
 def load_skills_config(path: str) -> list[dict]:
@@ -145,7 +187,7 @@ def load_skills_config(path: str) -> list[dict]:
     with open(path, "r", encoding="utf-8") as f:
         raw: dict = json.load(f)
 
-    raw_chains = sorted(raw.get("chains", []), key=lambda c: c.get("order", 0))
+    raw_chains = _order_by_trigger(raw.get("chains", []))
 
     chains: list[dict] = []
     for raw_chain in raw_chains:
@@ -165,16 +207,25 @@ def load_skills_config(path: str) -> list[dict]:
 
         for raw_step in raw_chain.get("steps", []):
             slot = raw_step.get("slot")
-            combo = raw_step.get("combo")
-            if not slot or not combo:
+            # Клавиатурная версия (2026-10-02): "slot" — это и есть клавиша
+            # (любая из приложения: буквы, цифры, F1-F12, знаки, Space...; см.
+            # InputManager.canonical_key), поэтому парсим именно его. Поле "combo"
+            # (геймпадное RB+X и т.п.) в экспорте ещё есть, но боту оно
+            # больше не нужно — намеренно игнорируем.
+            if not slot:
                 continue
 
             try:
-                steps = InputManager.parse_combo_string(combo)
+                steps = InputManager.parse_combo_string(slot)
             except ValueError as e:
                 logger.error(
                     "Цепочка '%s': шаг слота '%s' пропущен — %s",
                     chain_name, slot, e,
+                )
+                # И в input_debug.log: раньше пропуск был виден только в консоли,
+                # и шаг с P просто молча не жался.
+                input_debug_logger.warning(
+                    "CONFIG  '%s': шаг '%s' ПРОПУЩЕН — бот не знает такую клавишу", chain_name, slot,
                 )
                 continue
 
@@ -296,6 +347,9 @@ def load_skills_config(path: str) -> list[dict]:
                 cooldown_min, cooldown_max = cooldown_max, cooldown_min
 
         chains.append({
+            # id из приложения — по нему живая перезагрузка (bot.request_chains_reload)
+            # переносит кулдаун цепочки, даже если её переименовали.
+            "id": raw_chain.get("id") or chain_name,
             "name": chain_name,
             "sequence": sequence,
             "gamepad_steps": gamepad_steps,

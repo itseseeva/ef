@@ -1,0 +1,14 @@
+{
+ "state": "COMBAT",
+ "phase": "APPROACH",
+ "engaged": true,
+ "since_entry_s": 5.75,
+ "chain": "Цепочка #1 (Основная)",
+ "panel_found": true,
+ "hp": 100.0,
+ "txt": "HpText(sig=58122260, ink=128, 10x98)",
+ "gap_s": 0.8290000000270084,
+ "hp_before": 100.0,
+ "hp_after": 100.0,
+ "event": "hold_resolved"
+}

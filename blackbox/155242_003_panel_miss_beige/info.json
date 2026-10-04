@@ -1,0 +1,12 @@
+{
+ "state": "COMBAT",
+ "phase": "SCAN",
+ "engaged": false,
+ "since_entry_s": 5.52,
+ "chain": null,
+ "panel_found": true,
+ "hp": 100.0,
+ "txt": "HpText(sig=cffed4c2, ink=128, 10x96)",
+ "reason": "нет бежевой окантовки снизу",
+ "event": "panel_miss_beige"
+}

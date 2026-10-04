@@ -1,0 +1,13 @@
+{
+ "state": "COMBAT",
+ "phase": "APPROACH",
+ "engaged": true,
+ "since_entry_s": 8.86,
+ "chain": null,
+ "panel_found": true,
+ "hp": 31.65,
+ "txt": "HpText(sig=ecec82d0, ink=114, 10x98)",
+ "action": "attack_click",
+ "why": "выбранная цель не под прицелом",
+ "event": "guard_denied"
+}

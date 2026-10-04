@@ -1,0 +1,14 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": false,
+ "since_entry_s": 0.64,
+ "chain": "Цепочка #2 (доигрываю)",
+ "panel_found": true,
+ "hp": 100.0,
+ "txt": "HpText(sig=c0ee3b3f, ink=160, 11x80)",
+ "waited_s": 0.6400000000139698,
+ "why": "HP не менялось",
+ "list": "2:20м*! 3:38м 4:22м 5:26м 6:38м",
+ "event": "list_switch"
+}

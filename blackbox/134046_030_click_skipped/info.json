@@ -1,0 +1,13 @@
+{
+ "state": "COMBAT",
+ "phase": "APPROACH",
+ "engaged": false,
+ "since_entry_s": 6.97,
+ "chain": null,
+ "panel_found": true,
+ "hp": 100.0,
+ "txt": "HpText(sig=60984f21, ink=110, 10x98)",
+ "why": "свой Tab",
+ "waited_s": 2.014999999955762,
+ "event": "click_skipped"
+}

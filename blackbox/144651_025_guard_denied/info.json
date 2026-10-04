@@ -1,0 +1,13 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": true,
+ "since_entry_s": 4.58,
+ "chain": null,
+ "panel_found": true,
+ "hp": 100.0,
+ "txt": "HpText(sig=3f93c176, ink=178, 11x87)",
+ "action": "attack_click",
+ "why": "под прицелом другой моб — ПКМ выбрал бы его",
+ "event": "guard_denied"
+}

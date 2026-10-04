@@ -1,0 +1,16 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": true,
+ "since_entry_s": 6.83,
+ "chain": "Цепочка #2 (доигрываю)",
+ "panel_found": false,
+ "hp": 0.0,
+ "txt": "None",
+ "verdict": "lost",
+ "last_hp": 55.65,
+ "rate": 21.3426371501216,
+ "projected": 23.6360442748176,
+ "missing_for_s": 4.563000000081956,
+ "event": "lost_verdict"
+}

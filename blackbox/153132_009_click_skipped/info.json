@@ -1,0 +1,14 @@
+{
+ "state": "COMBAT",
+ "phase": "APPROACH",
+ "engaged": false,
+ "since_entry_s": 2.08,
+ "chain": "Цепочка #3",
+ "panel_found": true,
+ "hp": 59.71,
+ "txt": "HpText(sig=2dcf7db1, ink=308, 10x98)",
+ "why": "смена цели игрой",
+ "waited_s": 2.077999999979511,
+ "under": "other",
+ "event": "click_skipped"
+}

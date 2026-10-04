@@ -1,0 +1,13 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": false,
+ "since_entry_s": 4.06,
+ "chain": null,
+ "panel_found": true,
+ "hp": 100.0,
+ "txt": "HpText(sig=3c7d39d9, ink=194, 11x87)",
+ "waited_s": 4.061999999918044,
+ "list": "1:12м 2:21м 3:530м* 4:28м 5:31м! 6:34м! 7:21м",
+ "event": "list_switch"
+}

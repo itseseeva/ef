@@ -1,0 +1,12 @@
+{
+ "state": "SEARCH",
+ "phase": "LIST",
+ "engaged": false,
+ "since_entry_s": 1.39,
+ "chain": null,
+ "panel_found": false,
+ "hp": 0.0,
+ "txt": "None",
+ "reason": "нет бежевой окантовки снизу",
+ "event": "panel_miss_beige"
+}

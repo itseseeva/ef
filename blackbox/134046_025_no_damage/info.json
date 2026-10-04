@@ -1,0 +1,12 @@
+{
+ "state": "COMBAT",
+ "phase": "APPROACH",
+ "engaged": true,
+ "since_entry_s": 12.3,
+ "chain": null,
+ "panel_found": true,
+ "hp": 89.21,
+ "txt": "HpText(sig=fc70cba6, ink=119, 10x98)",
+ "quiet_s": 6.10899999999674,
+ "event": "no_damage"
+}

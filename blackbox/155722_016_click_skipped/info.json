@@ -1,0 +1,14 @@
+{
+ "state": "COMBAT",
+ "phase": "TAB",
+ "engaged": true,
+ "since_entry_s": 2.06,
+ "chain": null,
+ "panel_found": true,
+ "hp": 70.5,
+ "txt": "HpText(sig=f85166a9, ink=100, 10x98)",
+ "why": "вход в бой по Tab",
+ "waited_s": 2.0630000000237487,
+ "under": "other",
+ "event": "click_skipped"
+}
