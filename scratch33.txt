@@ -1,0 +1,30 @@
+                return res
+            last_reason = res.reason
+    return _fail(last_reason)
+
+
+def _check_candidate(frame: np.ndarray, line_a: np.ndarray, line_b: np.ndarray,
+                     yt: int, yb: int, w: int, h: int,
+                     other_cover_min: "float | None" = None) -> PanelResult:
+    """
+    Проверяет ОДНУ пару чёрных линий (yt — верхняя, yb — нижняя). line_a/line_b — маски
+    тёмного этих строк. other_cover_min=None: общий участок обеих линий (как всегда).
+    Иначе line_a — настоящая чёрная (по ней концы рамки), line_b — тусклая, ей достаточно
+    покрыть other_cover_min длины (см. read_panel, таблички других игроков поверх панели).
+    """
+    both = line_a & line_b if other_cover_min is None else line_a
+    group = _trim_edge_runs(_longest_group(np.flatnonzero(both), T.FRAME_LINE_MAX_GAP),
+                            T.FRAME_EDGE_RUN_MIN)
+    if group.size == 0:
+        return _fail("у линий нет общего участка")
+
+    x_left, x_right = int(group[0]), int(group[-1])
+    span = x_right - x_left + 1
+    if not (T.FRAME_SPAN_MIN <= span <= T.FRAME_SPAN_MAX):
+        return _fail("длина линий %d px вне диапазона" % span)
+    if group.size < span * T.FRAME_LINE_FILL_MIN:
+        return _fail("линии рамки с большими разрывами")
+    if other_cover_min is not None and line_b[x_left:x_right + 1].mean() < other_cover_min:
+        return _fail("вторая линия рамки закрыта больше чем на %d%%" % round((1 - other_cover_min) * 100))
+
+    # --- 2) Правая вертикальная граница рамки ----------------------------

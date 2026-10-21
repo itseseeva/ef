@@ -1,0 +1,16 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": false,
+ "since_entry_s": 0.17,
+ "chain": null,
+ "panel_found": true,
+ "hp": 0.0,
+ "txt": "HpText(sig=4b145953, ink=150, 10x98)",
+ "verdict": "killed",
+ "last_hp": 0.0,
+ "rate": 0.0,
+ "projected": 0.0,
+ "missing_for_s": 0.15700000000651926,
+ "event": "lost_verdict"
+}

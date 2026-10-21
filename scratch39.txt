@@ -1,0 +1,2 @@
+ok: False
+reason: окантовка рамки вне ROI

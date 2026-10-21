@@ -100,7 +100,7 @@ MAX_TARGET_HP_WIDTH  = 150   # ширина полоски при 100% HP — п
 # пересчитай эти два числа (в песочнице окно панели должно показать PANEL OK).
 # Старые значения для панели справа от центра: X = 75, Y = -90.
 TARGET_PANEL_OFFSET_X       = -926
-TARGET_PANEL_OFFSET_Y       = -162
+TARGET_PANEL_OFFSET_Y       = -510
 TARGET_PANEL_WIDTH          = 190
 TARGET_PANEL_HEIGHT         = 90
 MAX_TARGET_PANEL_BAR_WIDTH  = 145   # ширина полоски в панели при 100% HP

@@ -1,0 +1,38 @@
+    # Признак для bot.py: есть select_target (выбор цели биндом F1-F8 + атака).
+    TARGET_KEYS_SUPPORTED = True
+
+    def select_target(self, index: int, attack_key: str = "e") -> None:
+        """
+        Выбор цели из списка "Астрального зрения" БИНДОМ (2026-10-05): F{index} выбирает строку
+        (в игре забиндены F1-F8 на 8 строк), attack_key (E) — атака: персонаж бежит к цели и бьёт.
+        Без мыши и Alt, поэтому персонаж двигается и во время выбора; клавиши движения
+        отпускаются только прямо перед E (зажатая WASD оборвала бы бег к цели). Команда очереди.
+        Как проверить без игры: InputManager(backend=DryRunBackend()).select_target(3); wait_idle()
+        — в backend.calls: key f3 вниз/вверх, затем e вниз/вверх.
+        """
+        self._queue.put(("select_target", int(index), str(attack_key)))
+
+    def attack_key(self, key: str = "e") -> None:
+        """
+        Повторная атака (2026-10-05): цель уже выбрана, но персонаж не побежал/не бьёт — E ещё
+        раз. Движение отпускается перед нажатием (зажатая WASD оборвала бы бег к цели), после —
+        тот же сторож кликов, что у выбора. Команда очереди, без межскилльной паузы.
+        Как проверить без игры: InputManager(backend=DryRunBackend()).attack_key(); wait_idle().
+        """
+        self._queue.put(("attack_key", str(key)))
+
+    def _do_attack_key(self, key: str) -> None:
+        if key not in self.INPUT_MAP:
+            logger.error("InputManager: нет клавиши атаки %s", key)
+            return
+        if not self._interruptible_sleep(random.uniform(*self._SELECT_REACTION_S)):
+            return
+        with self._io_lock:
+            released = [v for kind, v in list(self._held) if kind == "key" and v in self._CLICK_RELEASE_KEYS]
+            for v in released:
+                self._backend.key_up(v)
+                self._held.discard(("key", v))
+        if released and not self._interruptible_sleep(random.uniform(*self._SELECT_RELEASE_TO_ATTACK_S)):
+                    elif cmd[0] == "select_target":
+                        self._do_select_target(cmd[1], cmd[2])
+    def _do_select_target(self, index: int, attack_key: str) -> None:

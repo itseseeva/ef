@@ -1,0 +1,14 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": true,
+ "since_entry_s": 2.98,
+ "chain": null,
+ "panel_found": true,
+ "hp": 98.56,
+ "txt": "HpText(sig=e87ef4d8, ink=196, 10x98)",
+ "gap_s": 0.43799999984912574,
+ "hp_before": 98.56,
+ "hp_after": 98.56,
+ "event": "hold_resolved"
+}

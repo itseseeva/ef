@@ -1,0 +1,20 @@
+                    why, self._search_phase.name,
+                )
+            return
+
+        # bars — сколько HP-баров нашло зрение в кадре, lock — держит ли оно
+        # захват на одном из них (см. VisionManager._find_hp_bar).
+        extra = "bars=%d marked=%d lock=%s enroute=%s eng=%s txt=%s" % (
+            getattr(self.vision, "last_candidate_count", 0), getattr(self.vision, "last_marked_count", 0),
+            getattr(self.vision, "bar_locked", False), self._enroute_active, self._engaged,
+            ("%08x/%d" % (panel_info.hp_text.sig, panel_info.hp_text.ink)) if panel_info.hp_text else "-",
+        )
+        if panel_info.found:
+            gamepad_debug_logger.debug(
+                "VISION  panel: found=True hp=%.1f%%  |  aim: found=%s offset=(%+.1f, %+.1f)  |  %s",
+                panel_info.hp_percent, aim_info.found, aim_info.offset_x, aim_info.offset_y, extra,
+            )
+        else:
+            gamepad_debug_logger.debug(
+                "VISION  panel: found=False (цели нет: %s)  фаза=%s  |  aim: found=%s offset=(%+.1f, %+.1f)  |  %s",
+                why, self._search_phase.name, aim_info.found, aim_info.offset_x, aim_info.offset_y, extra,

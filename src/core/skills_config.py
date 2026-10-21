@@ -110,10 +110,34 @@ def _order_by_trigger(raw_chains: "list[dict]") -> "list[dict]":
     """
     by_order = sorted(raw_chains, key=lambda c: c.get("order", 0))
     ids = {c.get("id") for c in by_order}
+    names = {c.get("id"): c.get("name") or c.get("id") for c in by_order}
     children: "dict[str, list[dict]]" = {}
     for c in by_order:
         parent = c.get("triggerAfter") or "start"
-        if parent != "start" and parent not in ids:
+        if parent == "priority":
+            # "Пуск: Приоритет" убран (2026-10-11, ротация по КД): старые конфиги с ним — обычная
+            # цепочка "со старта", её скиллы идут в общем порядке, каждый по своему КД.
+            c["_trigger_note"] = "со старта (бывший 'Приоритет')"
+            children.setdefault("start", []).append(c)
+            continue
+        if parent == "always":
+            # "Пуск: Всегда" (2026-10-11, ротация по КД): раньше делал ВСЕ скиллы цепочки "по своему
+            # КД". Теперь это решает переключатель "Постоянно" у каждого шага: пользователь собрал
+            # все 12 скиллов в цепочке "Всегда", а "Постоянно" отметил только у "6" — значит, цепочка
+            # обычная, со старта.
+            c["_trigger_note"] = "со старта (Пуск: Всегда)"
+            children.setdefault("start", []).append(c)
+            continue
+        # Пояснение для лога CHAINS (2026-10-05: "сделал 2 цепочки — ни одна не работает";
+        # в файле оказалась одна, со ссылкой на несуществующую вторую).
+        if parent == "start":
+            c["_trigger_note"] = "со старта"
+        elif parent in ids:
+            c["_trigger_note"] = "после '%s'" % names[parent]
+        else:
+            c["_trigger_note"] = "после цепочки %s, которой НЕТ в файле -> со старта" % parent
+            logger.warning("Цепочка '%s' запускается после %s, а такой цепочки в конфиге нет — "
+                           "считаю 'со старта'.", c.get("name"), parent)
             parent = "start"
         children.setdefault(parent, []).append(c)
 
@@ -190,6 +214,10 @@ def load_skills_config(path: str) -> list[dict]:
     raw_chains = _order_by_trigger(raw.get("chains", []))
 
     chains: list[dict] = []
+    # Скиллы "Жать по своему КД" (галочка в шаге цепочки, 2026-10-05): клавиша -> сам скилл.
+    # Из цепочки такой шаг убираем, а жмём его отдельной мини-цепочкой из одного нажатия
+    # со своей перезарядкой и САМЫМ ВЫСОКИМ приоритетом (см. конец функции).
+    independents: "dict[str, dict]" = {}
     for raw_chain in raw_chains:
         chain_name = raw_chain.get("name") or raw_chain.get("id") or "безымянная цепочка"
 
@@ -204,6 +232,9 @@ def load_skills_config(path: str) -> list[dict]:
         # напрямую) — проще завести новый параллельный список, чем менять
         # формат существующего и чинить все места, которые на него завязаны.
         cast_times: list[float | None] = []
+        # КД каждого шага ("КД скилла" в редакторе шага, 2026-10-11): ротация по КД считает
+        # готовность скилла только по нему (фото панели больше нет). Параллелен gamepad_steps.
+        step_cds: list[float] = []
 
         for raw_step in raw_chain.get("steps", []):
             slot = raw_step.get("slot")
@@ -302,16 +333,48 @@ def load_skills_config(path: str) -> list[dict]:
                         chain_name, slot, skill_id, cast_time_s,
                     )
 
+            # КОСТЫЛЬ (2026-10-14, от игрока): время применения по слоту — жёстко, поверх файла и бейджа.
+            # Убрать — удалить слот из _CAST_TIME_OVERRIDE_BY_SLOT.
+            if slot in _CAST_TIME_OVERRIDE_BY_SLOT:
+                cast_time_s = _CAST_TIME_OVERRIDE_BY_SLOT[slot]
+                logger.info("Цепочка '%s': шаг слота '%s' — время применения %.1f с (жёстко в коде).",
+                            chain_name, slot, cast_time_s)
+
+            # Тип действия (приложение, 2026-10-10): "press" — нажать (как всегда), "hold" — ЗАЖАТЬ
+            # клавишу на "Время каста" секунд (зарядка/канал, который идёт, пока кнопку держат).
+            # Время зажатия само и есть каст — отдельной паузы после отпускания не ждём.
+            if str(raw_step.get("actionType", "press")).lower() == "hold":
+                hold_s = cast_time_s if cast_time_s else _HOLD_DEFAULT_S
+                steps = [("holdfor_%g_%s" % (hold_s, s[6:]) if s.startswith("press_") else s) for s in steps]
+                cast_time_s = None
+                logger.info("Цепочка '%s': шаг '%s' — зажатие на %.1f с.", chain_name, slot, hold_s)
+
+            if _truthy(raw_step.get("independent")):
+                cd = _skill_cooldown(raw_step, chain_name, slot)
+                prev = independents.get(slot)
+                # Одна и та же клавиша "по своему КД" в двух цепочках — жмём один раз, по
+                # меньшему КД (иначе бот нажимал бы её дважды подряд).
+                if prev is None or cd < prev["cd"]:
+                    independents[slot] = {"cd": cd, "steps": steps, "cast": cast_time_s,
+                                          "repeat": repeat_count, "chain": chain_name,
+                                          "chain_id": raw_chain.get("id") or chain_name}
+                continue
+
+            step_cd = _skill_cooldown(raw_step, chain_name, slot)
             for _ in range(repeat_count):
                 sequence.append(slot)
                 gamepad_steps.append(steps)
                 cast_times.append(cast_time_s)
+                step_cds.append(step_cd)
 
         if not gamepad_steps:
-            logger.warning(
-                "Цепочка '%s' пропущена целиком — нет ни одного валидного шага.",
-                chain_name,
-            )
+            if any(v["chain"] == chain_name for v in independents.values()):
+                logger.info("Цепочка '%s': все шаги — 'по своему КД', сама цепочка пустая.", chain_name)
+            else:
+                logger.warning(
+                    "Цепочка '%s' пропущена целиком — нет ни одного валидного шага.",
+                    chain_name,
+                )
             continue
 
         # Интерфейс теперь отдаёт ОДНО число ("cooldownSeconds") вместо
@@ -354,15 +417,77 @@ def load_skills_config(path: str) -> list[dict]:
             "sequence": sequence,
             "gamepad_steps": gamepad_steps,
             "cast_times": cast_times,
+            "step_cds": step_cds,
             "cooldown_min": cooldown_min,
             "cooldown_max": cooldown_max,
             "next_ready_at": 0.0,
+            "trigger_note": raw_chain.get("_trigger_note", "со старта"),
+            "independent": bool(raw_chain.get("_always")),
         })
 
+    # Скиллы "по своему КД" — в НАЧАЛО списка: ротация берёт первую готовую цепочку,
+    # значит готовый по КД скилл жмётся раньше любой цепочки (вариант A: между цепочками,
+    # посреди уже идущей цепочки не вклиниваемся — замок цепочек это гарантирует).
+    indep_chains: list[dict] = []
+    for slot, v in independents.items():
+        cd = v["cd"]
+        indep_chains.append({
+            "id": "%s#own_cd_%s" % (v["chain_id"], slot),   # стабильный: КД переживает правки в приложении
+            "name": "%s (по КД %g с)" % (slot, cd),
+            "sequence": [slot] * v["repeat"],
+            "gamepad_steps": [v["steps"]] * v["repeat"],
+            "cast_times": [v["cast"]] * v["repeat"],
+            "step_cds": [cd] * v["repeat"],
+            "cooldown_min": cd * (1.0 - _OWN_CD_JITTER),
+            "cooldown_max": cd * (1.0 + _OWN_CD_JITTER),
+            "next_ready_at": 0.0,
+            "independent": True,
+            "trigger_note": "по своему КД %g с (шаг из цепочки '%s')" % (cd, v["chain"]),
+        })
+    # "Пуск: Всегда" — тоже вперёд (как скиллы по своему КД), порядок между собой — как был.
+    always = [c for c in chains if c.get("independent")]
+    regular = [c for c in chains if not c.get("independent")]
+    for c in always:
+        c["trigger_note"] = "всегда, по своему КД %g-%g с" % (c["cooldown_min"], c["cooldown_max"])
+    chains = indep_chains + always + regular
+
     logger.info(
-        "Конфиг цепочек: загружено %d цепочек(и) из '%s'.", len(chains), path
+        "Конфиг цепочек: загружено %d цепочек(и) из '%s' (из них скиллов по своему КД: %d).",
+        len(chains), path, len(indep_chains),
     )
     return chains
+
+
+_OWN_CD_JITTER = 0.10           # КД скилла "по своему КД": ±10%, как у цепочек (без робо-ритма)
+_OWN_CD_DEFAULT_S = 6.0         # фронт пишет 6 по умолчанию; то же, если поля нет/битое
+_OWN_CD_RANGE_S = (0.5, 300.0)  # защита от опечатки: 0 = спам клавишей, 3000 = никогда
+
+
+_HOLD_DEFAULT_S = 1.0     # "Зажатие клавиши" без времени каста — держим столько
+
+# Время применения по СЛОТУ, жёстко в коде — важнее файла и бейджа в интерфейсе (костыль 2026-10-14:
+# "8" зажимается 6 с, а не 5 с из файла). dict: слот -> секунды.
+_CAST_TIME_OVERRIDE_BY_SLOT: "dict[str, float]" = {"8": 6.0}
+
+
+def _truthy(v) -> bool:
+    """Галочка из JSON: true / "true" / 1 — включена; всё остальное — нет."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "да")
+    return bool(v) and v is not False
+
+
+def _skill_cooldown(raw_step: dict, chain_name: str, slot: str) -> float:
+    """КД скилла из поля skillCooldownSeconds (или cooldown) шага — с защитой от мусора."""
+    raw = raw_step.get("skillCooldownSeconds", raw_step.get("cooldown", _OWN_CD_DEFAULT_S))
+    try:
+        cd = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Цепочка '%s': skillCooldownSeconds шага '%s' не число (%r) — беру %.0f с.",
+                       chain_name, slot, raw, _OWN_CD_DEFAULT_S)
+        cd = _OWN_CD_DEFAULT_S
+    lo, hi = _OWN_CD_RANGE_S
+    return min(hi, max(lo, cd))
 
 
 if __name__ == "__main__":

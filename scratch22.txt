@@ -1,0 +1,30 @@
+            self._eg_dmg_base = t
+        elif self._eg_dmg_base_hp - hp >= self._ENGAGE_BAR_DROP_PCT:
+            hit = True                       # текста нет — запасной сигнал по полоске
+        if hit:
+            self._eg_dmg_base, self._eg_dmg_base_hp = t, hp
+            self._eg_dmg_change_since = None
+            self._eg_last_dmg_at = now
+            self._dmg_real_at = now               # урон идёт — стрейфы разрешены (см. _hitting_since_select)
+            return
+        quiet = now - self._eg_last_dmg_at
+        if quiet < self._ENGAGED_NO_DAMAGE_S or not self.input_manager.is_idle() or self._chain_busy(now):
+            return
+        if hp < self._NO_DAMAGE_TAB_MIN_HP:
+            # Моб РАНЕН — цель не меняем никогда (правило "до смерти"). Только
+            # напоминаем персонажу бить: ПКМ, если выбранная под прицелом.
+            if self._list_drives() and self._reengage_click(now, "урона нет %.1f с, моб ранен (%.0f%%)" % (quiet, hp)):
+                return                            # режим списка: клик по строке надёжнее ПКМ по прицелу
+            self._eg_last_dmg_at = now
+            clicked = self._crosshair_target() == "marked" or not self._USE_WORLD_VISION
+            gamepad_debug_logger.debug(
+                "ENGAGE  урона нет %.1f с, моб ранен (%.0f%%) — цель НЕ меняю%s",
+                quiet, hp, ", ПКМ по ней" if clicked else ", жду прицела",
+            )
+            if clicked:
+                self.input_manager.press_button("attack")
+                self._autoattack_engaged = True
+            return
+        gamepad_debug_logger.debug(
+            "ENGAGE  урона нет %.1f с при открытой ротации — шлагбаум закрываю, ищу цель (Tab)", quiet,
+        )

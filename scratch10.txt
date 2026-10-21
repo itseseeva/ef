@@ -1,0 +1,100 @@
+13: ровно 11 px, длиной ~142 px;
+16: кнопка X с серым крестиком;
+41: from src.core.vision import hp_text
+53: ok: bool                 # панель цели на экране (рамка + окантовка + кнопка X)
+56: # Прямоугольник ВНУТРЕННОСТИ полоски в координатах кадра (x, y, w, h);
+59: plate_checked: bool = True  # False — ROI обрезал кнопку X, проверка слабее
+60: # Отпечаток ТЕКСТА HP ("1 647/1 647", см. hp_text.py) или None, если текст
+63: text: "hp_text.HpText | None" = None
+85: & (r >= T.BEIGE_MIN_R) & (r <= T.BEIGE_MAX_R)
+103: кадрах не ломались. .any(axis=0) — векторно по столбцам, без цикла Python.
+107: return float(_beige_mask(band).any(axis=0).mean())
+110: def _longest_group(xs: np.ndarray, max_gap: int) -> np.ndarray:
+112: Из отсортированных индексов xs берёт самую длинную группу, где соседи
+113: отстоят не дальше max_gap+1. Так мелкий разрыв-насечка внутри чёрной
+117: if xs.size == 0:
+118: return xs
+119: breaks = np.flatnonzero(np.diff(xs) > max_gap + 1) + 1
+120: groups = np.split(xs, breaks)
+121: return max(groups, key=len)
+124: def _trim_edge_runs(xs: np.ndarray, min_run: int) -> np.ndarray:
+126: Отрезает с КРАЁВ группы короткие (< min_run px) куски, отделённые разрывом.
+127: Зачем: справа от конца линий рамки идут 2 светлых px торца, а за ними — мир.
+129: приклеивает к рамке 1-2 тёмных px фона: правый край уезжал на 3 px (168 -> 171
+134: if xs.size == 0:
+135: return xs
+136: runs = np.split(xs, np.flatnonzero(np.diff(xs) > 1) + 1)
+157: return np.count_nonzero(mask, axis=0) >= T.FILL_MIN_ROWS
+163: ПЕРВУЮ непрерывную полосу (разрывы <= FILL_MAX_GAP — текст "1 647/1 647"
+168: idx = np.flatnonzero(flags)
+169: if idx.size == 0 or idx[0] > T.FILL_MAX_GAP:
+171: end = int(idx[0])
+172: for i in idx[1:]:
+173: if i - end - 1 > T.FILL_MAX_GAP:
+188: на скриншоте ровно зоны панели (190x90 px) должно быть ok=True; на
+197: # max по каналам <= порога: тёмным считаем пиксель, где ВСЕ каналы малы
+199: mx = frame.max(axis=2)
+200: dark = mx <= T.FRAME_DARK_MAX
+202: cand_rows = np.flatnonzero(np.count_nonzero(dark, axis=1) >= need)
+208: # настоящая чёрная; остальные проверки (зазор 11 px, правая граница, окантовка, кнопка X)
+210: dim = mx <= T.FRAME_LINE_DIM_MAX
+211: dim_rows = np.flatnonzero(np.count_nonzero(dim, axis=1) >= need)
+217: def pairs(top_rows, bottom_rows, mixed):
+224: if mixed and ((yt_i in strict) == (yb_i in strict)):
+228: last_reason = "нет пары линий на расстоянии %d px" % T.FRAME_LINE_GAP
+230: for mixed, tops, bottoms in ((False, cand_rows, cand_rows), (True, dim_rows, dim_rows)):
+231: for yt, yb in pairs(tops, bottoms, mixed):
+232: if not mixed:
+237: # "DAD" в линии светлый просвет 8 px.
+256: group = _trim_edge_runs(_longest_group(np.flatnonzero(both), T.FRAME_LINE_MAX_GAP),
+261: x_left, x_right = int(group[0]), int(group[-1])
+262: span = x_right - x_left + 1
+263: if not (T.FRAME_SPAN_MIN <= span <= T.FRAME_SPAN_MAX):
+264: return _fail("длина линий %d px вне диапазона" % span)
+267: if other_cover_min is not None and line_b[x_left:x_right + 1].mean() < other_cover_min:
+271: # Ищем самый тёмный столбец в 0..FRAME_EDGE_SEARCH_PX правее конца линий: у новой
+272: # панели (2026-10-04) граница на 1 px дальше и светлее порога линий (29-34 против 24).
+274: for c in range(x_right, min(w, x_right + T.FRAME_EDGE_SEARCH_PX + 1)):
+275: col = frame[yt:yb + 1, c].max(axis=1) <= T.FRAME_EDGE_DARK_MAX
+276: edge_best = max(edge_best, float(col.mean()))
+286: # держат остальные проверки: две чёрные линии ровно в 11 px, правая граница и
+287: # малиновая кнопка X с крестиком.
+288: xa, xb = x_left + 2, x_right - 1
+291: top = frame[max(0, yt - T.BEIGE_ROWS):yt, xa:xb]
+292: bottom = frame[yb + 1:min(h, yb + 1 + T.BEIGE_ROWS), xa:xb]
+297: # кнопка X обязана найтись (см. BEIGE_BOTTOM_FRACTION_MIN).
+302: # --- 4) Кнопка X ------------------------------------------------------
+303: px0 = x_right + T.PLATE_DX_FROM
+304: px1 = min(x_right + T.PLATE_DX_TO + 1, w)
+305: plate_checked = (px1 - px0) >= T.PLATE_MIN_COLUMNS
+307: plate = frame[yt + T.PLATE_DY_FROM: yt + T.PLATE_DY_TO + 1, px0:px1].astype(np.int16)
+309: gb = np.maximum(g, b)
+311: (r >= T.PLATE_R_MIN) & (r <= T.PLATE_R_MAX)
+312: & (gb <= T.PLATE_GB_MAX) & (r >= gb * T.PLATE_R_OVER_GB)
+315: return _fail("нет малиновой плашки кнопки X")
+317: if np.count_nonzero(glyph) < T.PLATE_GLYPH_MIN_PIXELS:
+318: return _fail("нет крестика на кнопке X")
+320: return _fail("нет бежевой окантовки снизу")    # низ закрыт, а кнопку X не проверить — не рискуем
+323: fx0 = x_left + T.FILL_LEFT_PAD
+324: fx1 = x_right - T.FILL_RIGHT_PAD + 1          # срез правая граница не включает
+325: interior = frame[yt + 1: yb, fx0:fx1]
+331: bar=(fx0, yt + 1, fx1 - fx0, yb - yt - 1),
+333: text=hp_text.extract(hsv),
+339: Где на ВСЁМ кадре панель цели: (left, top) зоны roi_w x roi_h, в которой рамка HP лежит
+346: Как: тёмные (<= FRAME_DARK_MAX) горизонтальные отрезки длиной с рамку, над которыми не
+349: отрезки), ~5-10 мс на 1920x1080. Каждого кандидата проверяет сам read_panel на вырезке
+350: зоны — со всеми строгими проверками (зазор 11 px, правый край, окантовка, кнопка X),
+357: mx = cv2.max(cv2.max(b, g), r)
+358: dark = (mx <= T.FRAME_DARK_MAX).astype(np.uint8)
+364: close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (T.FRAME_LINE_MAX_GAP + 1, 1))
+366: lx, ly = T.PANEL_LINE_X_IN_ROI, T.PANEL_LINE_Y_IN_ROI
+367: pad = max(roi_w, roi_h)
+372: runs = cv2.morphologyEx(cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_k), cv2.MORPH_OPEN, open_k)
+375: if T.FRAME_SPAN_MIN - 10 <= stats[i][2] <= T.FRAME_SPAN_MAX + 6 and stats[i][3] <= 3]
+376: for x, y, cw, ch, _ in comps:
+378: key = (int(x) // 4, yt // 4)
+383: if checked > T.LOCATE_MAX_CANDIDATES:
+385: left, top = int(x) - lx, yt - ly
+392: # Подгоняем зону так, чтобы найденная рамка легла ровно в (lx, ly).
+393: fx = res.bar[0] - T.FILL_LEFT_PAD - lx
+395: return left + fx, top + fy

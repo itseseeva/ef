@@ -1,0 +1,5 @@
+57:     # (0, 0, 0, 0), если ok == False. Нужен отладочному окну и offset-ам.
+59:     plate_checked: bool = True  # False — ROI обрезал кнопку X, проверка слабее
+69:     return PanelResult(ok=False, reason=reason)
+189:     любом куске травы/неба/мира — ok=False с понятным reason.
+230:     for mixed, tops, bottoms in ((False, cand_rows, cand_rows), (True, dim_rows, dim_rows)):

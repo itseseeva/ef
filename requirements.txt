@@ -4,3 +4,6 @@ opencv-python==5.0.0.93
 pywebview
 pyautogui
 pillow
+dxcam; sys_platform == "win32"
+winsdk; sys_platform == "win32"
+easyocr  # чтение чата (OCR); первый запуск качает модели ~100 МБ

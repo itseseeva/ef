@@ -1,0 +1,30 @@
+    return max(groups, key=len)
+
+
+def _trim_edge_runs(xs: np.ndarray, min_run: int) -> np.ndarray:
+    """
+    Отрезает с КРАЁВ группы короткие (< min_run px) куски, отделённые разрывом.
+    Зачем: справа от конца линий рамки идут 2 светлых px торца, а за ними — мир.
+    Если мир там тёмный (камень, ночь), _longest_group "перепрыгивает" торец и
+    приклеивает к рамке 1-2 тёмных px фона: правый край уезжал на 3 px (168 -> 171
+    на кадрах чёрного ящика 2026-10-03), HP читалось 97.9% вместо 100%, а ширина
+    зоны текста HP менялась 98 <-> 99 — шлагбаум принял бы это за "HP изменилось".
+    Насечки ВНУТРИ линии не трогаем: режем только с краёв.
+    """
+    if xs.size == 0:
+        return xs
+    runs = np.split(xs, np.flatnonzero(np.diff(xs) > 1) + 1)
+    while len(runs) > 1 and len(runs[-1]) < min_run:
+        runs.pop()
+    while len(runs) > 1 and len(runs[0]) < min_run:
+        runs.pop(0)
+    return np.concatenate(runs)
+
+
+def _fill_columns(region: np.ndarray, hsv: "np.ndarray | None" = None) -> np.ndarray:
+    """
+    Булев вектор по колонкам: True там, где в колонке есть заливка HP.
+    hsv — уже посчитанный HSV того же куска: его же берёт читатель текста, и
+    конвертировать один и тот же кусок дважды за кадр незачем.
+    """
+    if hsv is None:

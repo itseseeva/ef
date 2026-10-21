@@ -1,0 +1,50 @@
+    темно (верхняя линия: над ней бежевая окантовка) или под которыми не темно (нижняя) —
+    морфология OpenCV (closing склеивает насечку в линии, opening оставляет только длинные
+    отрезки), ~5-10 мс на 1920x1080. Каждого кандидата проверяет сам read_panel на вырезке
+    зоны — со всеми строгими проверками (зазор 11 px, правый край, окантовка, кнопка X),
+    так что трава/тени/другие полоски HUD панелью не станут.
+    Как проверить без игры: locate_panel(cv2.imread("полный_скриншот.png")).
+    """
+    if frame is None or frame.ndim != 3 or frame.shape[0] < roi_h or frame.shape[1] < roi_w:
+        return None
+    b, g, r = cv2.split(np.ascontiguousarray(frame[..., :3]))
+    mx = cv2.max(cv2.max(b, g), r)
+    dark = (mx <= T.FRAME_DARK_MAX).astype(np.uint8)
+    h, w = dark.shape
+    edge_top = np.zeros_like(dark)
+    edge_top[2:] = dark[2:] & (1 - dark[:-2])           # верхняя линия: двумя строками выше — не темно
+    edge_bot = np.zeros_like(dark)
+    edge_bot[:-2] = dark[:-2] & (1 - dark[2:])          # нижняя: двумя строками ниже — не темно
+    close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (T.FRAME_LINE_MAX_GAP + 1, 1))
+    open_k = cv2.getStructuringElement(cv2.MORPH_RECT, (T.FRAME_SPAN_MIN - 10, 1))
+    lx, ly = T.PANEL_LINE_X_IN_ROI, T.PANEL_LINE_Y_IN_ROI
+    pad = max(roi_w, roi_h)
+    padded = None
+    seen = set()
+    checked = 0
+    for mask, dy in ((edge_top, 0), (edge_bot, -T.FRAME_LINE_GAP)):
+        runs = cv2.morphologyEx(cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_k), cv2.MORPH_OPEN, open_k)
+        n, _, stats, _ = cv2.connectedComponentsWithStats(runs, connectivity=8)
+        comps = [stats[i] for i in range(1, n)
+                 if T.FRAME_SPAN_MIN - 10 <= stats[i][2] <= T.FRAME_SPAN_MAX + 6 and stats[i][3] <= 3]
+        for x, y, cw, ch, _ in comps:
+            yt = int(y) + dy
+            key = (int(x) // 4, yt // 4)
+            if key in seen:
+                continue
+            seen.add(key)
+            checked += 1
+            if checked > T.LOCATE_MAX_CANDIDATES:
+                return None
+            left, top = int(x) - lx, yt - ly
+            if padded is None:                          # панель у края экрана: зона может выйти за него
+                padded = cv2.copyMakeBorder(frame[..., :3], pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+            crop = padded[top + pad:top + pad + roi_h, left + pad:left + pad + roi_w]
+            res = read_panel(crop)
+            if not res.ok:
+                continue
+            # Подгоняем зону так, чтобы найденная рамка легла ровно в (lx, ly).
+            fx = res.bar[0] - T.FILL_LEFT_PAD - lx
+            fy = res.bar[1] - 1 - ly
+            return left + fx, top + fy
+    return None

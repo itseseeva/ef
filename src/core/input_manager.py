@@ -49,6 +49,11 @@ import sys
 import threading
 import time
 from collections import deque
+try:
+    from src.core.camera_pitch import PitchGuard
+except ImportError:                     # запуск файлом (python src/core/input_manager.py) — корень проекта в путь
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    from src.core.camera_pitch import PitchGuard
 from ctypes import wintypes
 from dataclasses import dataclass
 
@@ -61,6 +66,13 @@ logger = logging.getLogger(__name__)
 _INPUT_LOG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "input_debug.log"
 )
+# Прошлый прогон НЕ теряем (2026-10-09: лог боя, где бот "тупил", стёрся перезапуском приложения):
+# перед новым файлом старый уезжает в input_debug.prev.log. Пустой не храним.
+try:
+    if os.path.getsize(_INPUT_LOG_PATH) > 0:
+        os.replace(_INPUT_LOG_PATH, _INPUT_LOG_PATH[:-4] + ".prev.log")
+except OSError:
+    pass
 input_debug_logger = logging.getLogger("input_debug")
 input_debug_logger.setLevel(logging.DEBUG)
 input_debug_logger.propagate = False
@@ -185,7 +197,10 @@ class AimTuning:
     adapt_latency_s: float = 0.1
     # Границы r. Замер вне (0.05, 2.0) — выброс (захват прыгнул на соседний бар,
     # моб резко побежал, повтор того же кадра) — его просто пропускаем.
-    adapt_r_min: float = 0.15
+    # 2026-10-06: было 0.15. Лог 03:42:55-59: r проваливался до 0.24-0.36 на стрейфах (цель сама
+    # едет по экрану, и это читалось как "параллакс"), камера крутилась в 3-4 раза дальше и
+    # перелетала цель (-160 px -> +89 px). Ниже 0.35 настоящий параллакс не бывал (моб вплотную ~0.3).
+    adapt_r_min: float = 0.35
     adapt_r_max: float = 1.0
     # Во сколько раз потолки скорости/ускорения выше при повороте к новому мобу:
     # это не слежение за целью, а "взгляд в сторону" — человек делает его
@@ -386,6 +401,21 @@ class _AimController:
 
         self._history.append((now, self._cum[0], self._cum[1]))
         return out[0], out[1]
+
+    def cancel_y(self, counts: int) -> None:
+        """
+        Поток камеры НЕ отправил counts счётчиков вертикали из того, что этот регулятор выдал
+        (коридор наклона, src/core/camera_pitch.py). Возвращаем их себе: цель на экране не
+        сдвинулась, поворота не было, скорость по вертикали гасим — иначе регулятор "думал" бы,
+        что довернул, и оценка уехала бы (dead reckoning по несделанному повороту).
+        """
+        if not counts:
+            return
+        shift = counts * self._t.gain_y * self._mouse_sign[1]   # счётчики -> px поворота
+        self._est[1] += self._r[1] * shift
+        self._cum[1] -= shift
+        self._vel[1] = 0.0
+        self._rem[1] = 0.0
 
     def freeze(self) -> None:
         """
@@ -649,6 +679,21 @@ class _ScanController:
         self._last_total = total
         self._vel = [fx / dt, fy / dt]
         return self._quantize(fx, fy)
+
+    def cancel_y(self, counts: int) -> None:
+        """
+        Поток камеры НЕ отправил counts счётчиков вертикали из того, что этот регулятор выдал
+        (коридор наклона, src/core/camera_pitch.py). Возвращаем их себе: цель на экране не
+        сдвинулась, поворота не было, скорость по вертикали гасим — иначе регулятор "думал" бы,
+        что довернул, и оценка уехала бы (dead reckoning по несделанному повороту).
+        """
+        if not counts:
+            return
+        shift = counts * self._t.gain_y * self._mouse_sign[1]   # счётчики -> px поворота
+        self._est[1] += self._r[1] * shift
+        self._cum[1] -= shift
+        self._vel[1] = 0.0
+        self._rem[1] = 0.0
 
     def freeze(self) -> None:
         """
@@ -987,6 +1032,69 @@ def _build_input_map() -> "dict[str, tuple[str, str] | None]":
     return mapping
 
 
+# ---------------------------------------------------------------------------
+# Точные паузы в Windows (2026-10-05, "микропаузы ещё меньше")
+# ---------------------------------------------------------------------------
+# Все короткие паузы ввода (удержание клавиши, F -> E, между скиллами) ждут через
+# Event.wait(), а он в Windows спит квантами системного таймера — по умолчанию 15.6 мс.
+# Лог 17:08: просили держать 72 мс, держали 86; 55 -> 66; 60 -> 64: каждая пауза
+# "переспала" до 15 мс, а их в выборе цели и цепочке скиллов по 5-10 подряд.
+#   1. timeBeginPeriod(1) — таймер процесса 1 мс (так делают игры, OBS, браузеры).
+#   2. Windows 11 отнимает точный таймер и урезает скорость у процессов в ФОНЕ (EcoQoS,
+#      "power throttling") — а бот всегда в фоне, на переднем плане игра. Отказываемся
+#      от этого троттлинга для своего процесса (SetProcessInformation).
+#   3. Приоритет процесса "выше обычного": когда игра грузит процессор, планировщик Windows
+#      не откладывает поток ввода бота на лишние кванты. HIGH не берём — может тормозить игру.
+# Всё — стандартные функции Windows (kernel32/winmm), к игре не прикасается. Не Windows —
+# ничего не делает (тесты и песочница).
+_PROCESS_POWER_THROTTLING = 4                          # PROCESS_INFORMATION_CLASS.ProcessPowerThrottling
+_THROTTLE_EXECUTION_SPEED = 0x1
+_THROTTLE_IGNORE_TIMER_RESOLUTION = 0x4
+_ABOVE_NORMAL_PRIORITY_CLASS = 0x8000
+_timing_tuned = False
+
+
+class _PowerThrottlingState(ctypes.Structure):
+    _fields_ = [("Version", ctypes.c_ulong), ("ControlMask", ctypes.c_ulong), ("StateMask", ctypes.c_ulong)]
+
+
+def tune_windows_timing() -> "list[str]":
+    """
+    Один раз за процесс: таймер 1 мс + без фонового троттлинга + приоритет выше обычного.
+    Возвращает, что удалось включить (для лога). Ошибки не роняют бота — работает как раньше.
+    Как проверить: в логе строка "TIMING ..."; удержание клавиш в строках PRESS почти
+    совпадает с "держим N мс" (раньше перебор до +15 мс).
+    """
+    global _timing_tuned
+    if _timing_tuned or sys.platform != "win32":
+        return []
+    _timing_tuned = True
+    done: "list[str]" = []
+    try:
+        winmm = ctypes.WinDLL("winmm")
+        if winmm.timeBeginPeriod(1) == 0:              # TIMERR_NOERROR
+            done.append("таймер 1 мс")
+            import atexit
+            atexit.register(winmm.timeEndPeriod, 1)
+    except Exception as e:                             # нет winmm (странная сборка Windows) — живём с 15.6 мс
+        logger.debug("timeBeginPeriod: %s", e)
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        st = _PowerThrottlingState(1, _THROTTLE_EXECUTION_SPEED | _THROTTLE_IGNORE_TIMER_RESOLUTION, 0)
+        k32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        if k32.SetProcessInformation(k32.GetCurrentProcess(), _PROCESS_POWER_THROTTLING,
+                                     ctypes.byref(st), ctypes.sizeof(st)):
+            done.append("без фонового троттлинга")
+        k32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        if k32.SetPriorityClass(k32.GetCurrentProcess(), _ABOVE_NORMAL_PRIORITY_CLASS):
+            done.append("приоритет выше обычного")
+    except Exception as e:                             # Windows 7/8 без SetProcessInformation — пропускаем
+        logger.debug("power throttling/priority: %s", e)
+    input_debug_logger.debug("TIMING  %s", ", ".join(done) if done else "точный таймер включить не удалось")
+    return done
+
+
 class InputManager:
     """
     Клавиатура + мышь под тем же интерфейсом и с той же архитектурой
@@ -1015,14 +1123,13 @@ class InputManager:
 
     # Сколько мс держим клавишу/кнопку. Диапазон, а не константа: одинаковая
     # длительность каждого нажатия — статистический отпечаток бота.
-    _HOLD_KEY_MS = (60, 140)
+    _HOLD_KEY_MS = (40, 70)  # ТУРБО-2 2026-10-05: было (45, 90)
 
     # Случайная пауза ПЕРЕД нажатием — имитация времени реакции. Идеальная
     # синхронность "решение -> действие" для человека невозможна.
-    _REACTION_DELAY_S = (0.0, 0.05)
-
+    _REACTION_DELAY_S = (0.0, 0.02)  # ТУРБО-2 2026-10-05: было (0.0, 0.05)
     # Смена цели Tab-ом: удержание чуть короче обычного скилла (лёгкий тап).
-    _TARGET_TAP_HOLD_MS = (40, 90)
+    _TARGET_TAP_HOLD_MS = (35, 55)  # ТУРБО-2 2026-10-05: было (40, 65)
 
     # Длительность ходьбы получает ±джиттер, чтобы повторяющийся
     # "ровно 1.0 секунду вперёд" не выглядел как скрипт.
@@ -1049,9 +1156,8 @@ class InputManager:
 
     # Отдаление камеры колесом (zoom_out): пауза между щелчками и короткая
     # заморозка мыши вокруг прокрутки — человек не крутит колесо, ведя камеру.
-    _WHEEL_NOTCH_GAP_S = (0.04, 0.12)
-    _WHEEL_SETTLE_S = (0.08, 0.16)
-
+    _WHEEL_NOTCH_GAP_S = (0.02, 0.05)  # ТУРБО-2 2026-10-05: было (0.04, 0.12)
+    _WHEEL_SETTLE_S = (0.03, 0.07)  # ТУРБО-2 2026-10-05: было (0.08, 0.16)
     # ПЛАВНЫЙ РАЗВОРОТ (start_sweep, 2026-10-04, просьба пользователя): камера едет
     # ТОЛЬКО по горизонтали, с почти постоянной скоростью — "по прямой слева направо",
     # без взмахов, пауз и наклона вверх-вниз (обычный осмотр иногда клал камеру в пол).
@@ -1083,7 +1189,7 @@ class InputManager:
     _CLICK_RELEASE_ALT_S = (0.03, 0.06)   # после клика до отпускания Alt
     _CLICK_RELEASE_KEYS = frozenset({"w", "a", "s", "d", "space", "shift"})
     _CLICK_STRAFE_P = 0.85                 # иногда человек и стоит, пока кликает
-    _CLICK_STRAFE_LEAD_S = (0.06, 0.16)    # пошёл вбок -> потом Alt
+    _CLICK_STRAFE_LEAD_S = (0.02, 0.05)  # ТУРБО-2 2026-10-05: было (0.03, 0.08)
     _CLICK_MOVE_GUARD_S = 0.3
 
     # Пауза между шагами ВНУТРИ комбо (например shift -> 1 -> отпустить).
@@ -1096,7 +1202,19 @@ class InputManager:
     # 1.17 -> 1.03 с). Быстрый горб не трогаем: 0.88 — нижняя граница, на которую
     # опирается замок цепочек в bot.py (_CHAIN_MIN_GAP_S), и короче неё игра может
     # "съесть" нажатие посреди анимации прошлого скилла.
-    _SKILL_CAST_GAP_BANDS_S = ((0.88, 0.98), (1.0, 1.25))
+    # ТУРБО 2026-10-05 ("максимум выжми"): ((0.88, 0.98), (1.0, 1.25)) -> ((0.80, 0.88), (0.90, 1.00)).
+    # Если в бою начнут пропадать скиллы (нажатие "съедено" анимацией) — верни прежние.
+    # 2026-10-06 (просьба: "задержка 0.5 между нажатиями"): ~0.5 с, небольшой разброс в обе
+    # стороны — ровно одинаковые интервалы выдают бота. Было ((0.70, 0.78), (0.78, 0.88)).
+    # Если в бою начнут пропадать скиллы (нажатие "съела" анимация прошлого) — поднять обратно.
+    # 2026-10-06 (просьба: "задержка больше, 0.8 с"): ~0.8 с с разбросом +-0.05. Было ((0.46, 0.51), (0.50, 0.55)).
+    # 2026-10-10: 0.8 -> ~0.6 с. Теперь не страшно, если игра "съест" нажатие посреди анимации:
+    # проверка нажатий (skill_check.PressCheckLoop) видит, что слот не ушёл в откат, и жмёт ещё раз.
+    # Если в логе много "не нажался — жму ещё раз" — поднять до ((0.66, 0.72), (0.70, 0.76)).
+    # 2026-10-11 (просьба: "делей 0.8 вместо 0.6"): ~0.8 с с разбросом +-0.05 (два горба, как раньше).
+    # Было ((0.57, 0.63), (0.61, 0.67)). Вместе с этим подняты bot._CHAIN_MIN_GAP_S и rotation.GAP_S —
+    # три числа должны совпадать, иначе ротация считает время занятости ввода неверно.
+    _SKILL_CAST_GAP_BANDS_S = ((0.77, 0.83), (0.81, 0.87))
 
     # Временный флаг отладки: фиксированная пауза вместо двугорбой.
     _DEBUG_FLAT_GAP_S: "float | None" = None
@@ -1107,8 +1225,10 @@ class InputManager:
     _CAST_GAP_JITTER = (1.0, 1.15)
 
     def __init__(self, backend=None) -> None:
+        self._chat_locked = False
         if backend is None:
             backend = Win32Backend() if sys.platform == "win32" else DryRunBackend()
+            tune_windows_timing()                      # настоящий ввод — точные паузы (см. выше)
         self._backend = backend
 
         self._queue: "queue.Queue[tuple]" = queue.Queue()
@@ -1174,14 +1294,30 @@ class InputManager:
         # не жмёт: движение сбило бы каст. 0.0 — каста нет. Пишет поток кнопок, читает
         # поток движения; float присваивается атомарно под GIL.
         self._casting_until = 0.0
+        # Скилл и движение (2026-10-05, "стрейфы иногда перекрывают поток комбо"): когда последний
+        # раз нажата клавиша скилла и исполняется ли комбо сейчас — см. jump_allowed/movement_key.
+        self._last_skill_at = float("-inf")
+        # Нажатия скиллов (клавиша, время нажатия) для проверки по откату (src/core/skill_check.py).
+        # deque с maxlen: поток ввода только добавляет, поток бота забирает popleft — обе
+        # операции атомарны под GIL, лок не нужен; старое само вытесняется, если никто не читает.
+        self.skill_presses: "deque[tuple[str, float]]" = deque(maxlen=32)
+        self._combo_active = False
         # Сумма ВСЕХ горизонтальных сдвигов камеры, которые отправил бот (поток камеры,
         # жесты поворота, прямые сдвиги). navigation.py по ней ведёт курс камеры между
         # замерами по миникарте: курс = замер + (счётчики сейчас - тогда) / счётчиков_на_градус.
         # int += в одном потоке под _io_lock; читается атомарно.
         self._yaw_counts = 0
+        # Наклон камеры (src/core/camera_pitch.py): одометр вертикали и коридор, где прицел
+        # не упирается в нижний упор ("камера висит сверху"). Трогать — только под _io_lock.
+        self._pitch = PitchGuard()
+        self.pitch_blocked_at = float("-inf")    # когда регулятор последний раз упёрся в низ коридора
         # Сколько кликов курсором реально нажато (кнопка мыши ушла). bot.py по нему понимает,
         # что клик по списку состоялся и стрейфы пора прекратить (дальше персонаж бежит сам).
         self.clicks_pressed = 0
+        # Когда бот последний раз САМ нажал каждую клавишу (имя -> time.monotonic). Нужен
+        # приложению: его глобальные хоткеи F4/F5/F6 видят и нажатия бота (SendInput), а бот
+        # теперь жмёт F1-F8 для выбора цели — F4 не должен останавливать бота (2026-10-05).
+        self._injected_at: "dict[str, float]" = {}
         # Сразу после клика новые клавиши движения не жмём: нажатие оборвало бы бег к цели,
         # который клик только что запустил (страховка на случай, если FSM переключит ноги
         # на "стоп" на тик позже).
@@ -1209,6 +1345,7 @@ class InputManager:
         if action not in self.INPUT_MAP:
             logger.error("InputManager: неизвестное действие '%s' — нет в INPUT_MAP.", action)
             return
+        if self._chat_locked: return
         self._queue.put(("press_button", action))
 
     def aim_with_stick(self, dx: float, dy: float, adaptive: bool = False, gentle: bool = False) -> None:
@@ -1256,7 +1393,7 @@ class InputManager:
         with self._aim_lock:
             self._scan_enabled = False
 
-    def start_sweep(self) -> None:
+    def start_sweep(self, side: int = 0) -> None:
         """
         Плавный горизонтальный разворот камеры (см. _SWEEP_*). Идемпотентно: повторный
         вызов не меняет ни сторону, ни скорость. Сторона и скорость — случайные на
@@ -1266,7 +1403,7 @@ class InputManager:
         """
         with self._aim_lock:
             if self._sweep_dir == 0:
-                self._sweep_dir = random.choice((-1, 1))
+                self._sweep_dir = side if side in (-1, 1) else random.choice((-1, 1))
                 self._sweep_speed = random.uniform(*self._SWEEP_SPEED_PX_S)
 
     def stop_sweep(self) -> None:
@@ -1279,6 +1416,7 @@ class InputManager:
         with self._io_lock:
             self._backend.mouse_move_rel(dx, dy)
             self._yaw_counts += int(dx)
+            self._pitch.applied(int(dy))
 
     def zoom_out(self, notches: int) -> None:
         """
@@ -1291,6 +1429,53 @@ class InputManager:
 
     # Признак для bot.py: click_at умеет strafe=True (старые заглушки тестов — нет).
     CLICK_STRAFE_SUPPORTED = True
+    # Признак для bot.py: есть select_target (выбор цели биндом F1-F8 + атака).
+    TARGET_KEYS_SUPPORTED = True
+
+    def select_target(self, index: int, attack_key: str = "e") -> None:
+        """
+        Выбор цели из списка "Астрального зрения" БИНДОМ (2026-10-05): F{index} выбирает строку
+        (в игре забиндены F1-F8 на 8 строк), attack_key (E) — атака: персонаж бежит к цели и бьёт.
+        Без мыши и Alt, поэтому персонаж двигается и во время выбора; клавиши движения
+        отпускаются только прямо перед E (зажатая WASD оборвала бы бег к цели). Команда очереди.
+        Как проверить без игры: InputManager(backend=DryRunBackend()).select_target(3); wait_idle()
+        — в backend.calls: key f3 вниз/вверх, затем e вниз/вверх.
+        """
+        self._queue.put(("select_target", int(index), str(attack_key)))
+
+    def attack_key(self, key: str = "e") -> None:
+        """
+        Повторная атака (2026-10-05): цель уже выбрана, но персонаж не побежал/не бьёт — E ещё
+        раз. Движение отпускается перед нажатием (зажатая WASD оборвала бы бег к цели), после —
+        тот же сторож кликов, что у выбора. Команда очереди, без межскилльной паузы.
+        Как проверить без игры: InputManager(backend=DryRunBackend()).attack_key(); wait_idle().
+        """
+        self._queue.put(("attack_key", str(key)))
+
+    def _do_attack_key(self, key: str) -> None:
+        if key not in self.INPUT_MAP:
+            logger.error("InputManager: нет клавиши атаки %s", key)
+            return
+        if not self._interruptible_sleep(random.uniform(*self._SELECT_REACTION_S)):
+            return
+        with self._io_lock:
+            released = [v for kind, v in list(self._held) if kind == "key" and v in self._CLICK_RELEASE_KEYS]
+            for v in released:
+                self._backend.key_up(v)
+                self._held.discard(("key", v))
+        if released and not self._interruptible_sleep(random.uniform(*self._SELECT_RELEASE_TO_ATTACK_S)):
+            return
+        input_debug_logger.debug("ATTACK  %s ещё раз%s", key.upper(),
+                                 " (отпустил %s)" % "+".join(sorted(released)) if released else "")
+        if not self._down(key):
+            return
+        with self._io_lock:
+            self.clicks_pressed += 1
+            self._click_guard_until = time.monotonic() + self._CLICK_MOVE_GUARD_S
+        try:
+            self._interruptible_sleep(random.uniform(*self._HOLD_KEY_MS) / 1000.0)
+        finally:
+            self._up(key)
 
     def click_at(self, x: float, y: float, button: str = "left", strafe: bool = False) -> None:
         """
@@ -1325,7 +1510,30 @@ class InputManager:
         # tag — метка этого скилла (бот: (номер запуска цепочки, номер шага)). Когда клавиша
         # скилла реально нажата, метка попадает в _done_tags (см. combo_done): по ним бот
         # знает, какие скиллы цепочки успели нажаться до смерти цели (заморозка цепочек).
+        if self._chat_locked: return
         self._queue.put(("execute_combo", list(actions), cast_time_s, self._cut_gen, tag))
+
+    def execute_combo_now(self, actions: "list[str]", cast_time_s: "float | None" = None,
+                          tag: "object | None" = None) -> None:
+        """
+        Как execute_combo, но задача встаёт ПЕРВОЙ в очередь — сразу после нажатия, которое
+        исполняется сейчас (2026-10-05: скилл "по своему КД" больше не ждёт конца чужой
+        цепочки до ~4 с). Порядок остальных задач не меняется. Несколько шагов подряд —
+        звать в обратном порядке (каждый встаёт перед предыдущим).
+
+        queue.Queue не умеет "в начало" — делаем то же, что её put(), но appendleft под тем же
+        замком (mutex + счётчик unfinished_tasks + notify): is_idle/wait_idle/cancel работают
+        как с обычной задачей.
+        Как проверить без игры: InputManager(backend=DryRunBackend()); execute_combo(["press_2"]);
+        execute_combo(["press_3"]); execute_combo_now(["press_6"]) -> нажатия 2, 6, 3.
+        """
+        if getattr(self, "_chat_locked", False): return
+        item = ("execute_combo", list(actions), cast_time_s, self._cut_gen, tag)
+        q = self._queue
+        with q.not_full:
+            q.queue.appendleft(item)
+            q.unfinished_tasks += 1
+            q.not_empty.notify()
 
     def combo_done(self, tag: object) -> bool:
         """Нажат ли уже скилл с этой меткой (см. execute_combo(tag=...))."""
@@ -1344,6 +1552,7 @@ class InputManager:
         сочетания клавиш игры, а не шаг. Отпускать можно всегда.
         """
         target = self.INPUT_MAP.get(name)
+        if getattr(self, "_chat_locked", False): return False
         if target is None or target[0] != "key":
             return False
         with self._io_lock:
@@ -1352,8 +1561,11 @@ class InputManager:
                     return False
                 if time.monotonic() < self._click_guard_until:
                     return False
+                if self._combo_active or time.monotonic() - self._last_skill_at < self._MOVE_AFTER_SKILL_S:
+                    return False                        # новые клавиши ходьбы — не в тот же миг, что скилл
                 if ("key", "alt") in self._held or ("key", "ctrl") in self._held:
                     return False
+                self._injected_at[target[1]] = time.monotonic()
                 self._backend.key_down(target[1])
                 self._held.add(target)
             else:
@@ -1373,18 +1585,87 @@ class InputManager:
                 return False
             if ("key", "alt") in self._held:
                 return False
-            self._backend.mouse_move_rel(int(dx), int(dy))
+            dy = self._pitch.allowed(int(dy))
+            self._backend.mouse_move_rel(int(dx), dy)
             self._yaw_counts += int(dx)
+            self._pitch.applied(dy)
         return True
+
+    def calibrate_pitch(self) -> None:
+        """Выставить наклон камеры: вниз до упора и вверх в рабочий коридор (жест ~1.5 с, без цели)."""
+        with self._io_lock:
+            self._pitch.start_calibration()
+        input_debug_logger.debug("PITCH   калибровка наклона: вниз до упора, потом в рабочий коридор")
+
+    def pitch_scan_start(self) -> None:
+        """Камера вниз до упора — прицел на персонаже (для орлиного зрения R). Жест играет поток камеры."""
+        with self._io_lock:
+            self._pitch.start_scan()
+        input_debug_logger.debug("PITCH   камера вниз на персонажа (для скана R)")
+
+    def pitch_at_floor(self) -> bool:
+        """Камера в нижнем упоре и стоит — можно жать R."""
+        return self._pitch.at_floor
+
+    def pitch_scan_release(self, after_s: float = 0.0) -> None:
+        """R нажат (или отменили) — через after_s камера возвращается к прежнему наклону."""
+        with self._io_lock:
+            self._pitch.release_scan(after_s)
+
+    def pitch_state(self) -> "tuple[float | None, bool]":
+        """(наклон, градусы от нижнего упора или None; идёт ли калибровка) — для лога бота."""
+        p = self._pitch.p
+        return (None if p is None else p / self._pitch.k, self._pitch.calibrating)
 
     def camera_yaw_counts(self) -> int:
         """Сколько счётчиков мыши по горизонтали бот всего отправил в камеру (+ вправо)."""
         return self._yaw_counts
 
+    # Новую клавишу движения не жмём, пока жмётся клавиша скилла и столько после: одновременные
+    # нажатия игра иногда "склеивала" — скилл не выходил (жалоба 2026-10-05). Отпускать можно всегда.
+    _MOVE_AFTER_SKILL_S = 0.06
+    # Прыжок — только вдали от скиллов: в воздухе часть скиллов игра не кастует, нажатие "съедается".
+    _JUMP_SKILL_GUARD_S = 0.45
+
+    def jump_allowed(self) -> bool:
+        """
+        Можно ли сейчас прыгнуть (поток движения спрашивает перед пробелом): скилл не жмётся,
+        последний был > _JUMP_SKILL_GUARD_S назад и в очереди ввода нет следующего скилла.
+        Как проверить без игры: execute_combo(["press_2"]) -> jump_allowed() False до конца паузы.
+        """
+        if self._combo_active or time.monotonic() - self._last_skill_at < self._JUMP_SKILL_GUARD_S:
+            return False
+        q = self._queue
+        with q.mutex:
+            return not any(item[0] == "execute_combo" for item in q.queue)
+
+    def set_chat_lock(self, locked: bool) -> None:
+        """
+        Замок ввода на время печати в чат (2026-10-09). РАНЬШЕ этот метод по ошибке стоял внутри
+        блока `if __name__ == "__main__":` в конце файла — у InputManager его не было, чат-бот
+        проверял hasattr(inp, 'set_chat_lock') -> False, замок НЕ включался, и скиллы/WASD бота
+        печатались в открытую строку чата. Теперь это метод класса.
+        Что делает: флаг (его проверяют _down/_up, движение, камера), выброс очереди скиллов
+        с обрывом текущей паузы, ожидание, пока воркер доиграет текущее нажатие (до 1.5 с),
+        и отпускание всего, что зажато. Снятие замка — просто флаг.
+        """
+        self._chat_locked = locked
+        if not locked:
+            input_debug_logger.debug("CHAT    замок ввода снят — бой продолжается")
+            return
+        self.cancel_pending_actions(cut_current_wait=True)
+        end = time.monotonic() + 1.5
+        while self._queue.unfinished_tasks and time.monotonic() < end:
+            time.sleep(0.01)                          # текущее нажатие доигрывает воркер
+        self._release_all()
+        input_debug_logger.debug("CHAT    замок ввода включён: очередь сброшена, клавиши отпущены")
+
     def movement_blocked(self) -> "str | None":
         """Почему движению сейчас нельзя жать клавиши (None — можно): паника или долгий каст."""
         if self._abort_event.is_set() or self._stop_event.is_set():
             return "стоп"
+        if getattr(self, "_chat_locked", False):
+            return "чат"
         if time.monotonic() < self._casting_until:
             return "каст"
         return None
@@ -1412,6 +1693,7 @@ class InputManager:
         готовая точка подключения для движения.
         """
         key = self._MOVE_KEYS.get(direction)
+        if getattr(self, "_chat_locked", False): return
         if key is None:
             raise ValueError(
                 f"move: неизвестное направление '{direction}', допустимо: {sorted(self._MOVE_KEYS)}"
@@ -1519,6 +1801,7 @@ class InputManager:
         self._queue.join()
 
     def is_idle(self) -> bool:
+        if self._chat_locked: return False
         """
         Неблокирующая проверка: очередь пуста И воркер ничего не исполняет.
         unfinished_tasks, а не queue.empty(): empty() даст True, пока
@@ -1572,19 +1855,27 @@ class InputManager:
     def _down(self, name: str) -> bool:
         """Зажать действие. False — у действия нет клавиши (осознанная пустышка)."""
         target = self.INPUT_MAP.get(name)
+        if getattr(self, "_chat_locked", False) and name not in ("enter", "esc", "space"): return False
         if target is None:
             return False
         kind, value = target
         with self._io_lock:
             if kind == "key":
+                self._injected_at[value] = time.monotonic()
                 self._backend.key_down(value)
             else:
                 self._backend.mouse_button(value, True)
             self._held.add(target)
         return True
 
+    def injected_recently(self, key: str, window_s: float = 0.6) -> bool:
+        """Бот сам нажимал эту клавишу за последние window_s секунд (хоткеи приложения его пропускают)."""
+        t = self._injected_at.get(key.lower())
+        return t is not None and time.monotonic() - t <= window_s
+
     def _up(self, name: str) -> None:
         target = self.INPUT_MAP.get(name)
+        if getattr(self, "_chat_locked", False) and name not in ("enter", "esc", "space"): return
         if target is None:
             return
         kind, value = target
@@ -1633,12 +1924,20 @@ class InputManager:
             except queue.Empty:
                 continue
 
+            skipped_cd = False
             try:
                 try:
                     if cmd[0] == "press_button":
                         self._do_press_button(cmd[1])
+                    elif cmd[0] == "execute_combo" and self._defer_if_on_cd(cmd):
+                        skipped_cd = True                # скилл на откате: не жмём, паузу каста не ждём
                     elif cmd[0] == "execute_combo":
+                        self._combo_active = True
                         pressed = self._do_execute_combo(cmd[1])
+                        self._last_skill_at = time.monotonic()
+                        if pressed and len(cmd[1]) == 1 and cmd[1][0].startswith("press_"):
+                            self._last_combo_key = cmd[1][0][6:]
+                            self._last_combo_at = self._last_skill_at
                         tag = cmd[4] if len(cmd) > 4 else None
                         if pressed and tag is not None:
                             self._done_tags.add(tag)     # set.add атомарен под GIL
@@ -1646,6 +1945,10 @@ class InputManager:
                         self._do_tap_target(cmd[1])
                     elif cmd[0] == "zoom_out":
                         self._do_zoom_out(cmd[1])
+                    elif cmd[0] == "select_target":
+                        self._do_select_target(cmd[1], cmd[2])
+                    elif cmd[0] == "attack_key":
+                        self._do_attack_key(cmd[1])
                     elif cmd[0] == "click_at":
                         self._do_click_at(cmd[1], cmd[2], cmd[3], cmd[4] if len(cmd) > 4 else False)
                     elif cmd[0] == "move":
@@ -1656,7 +1959,10 @@ class InputManager:
                 # Пауза ПОСЛЕ нажатия, но ДО task_done(): is_idle()/
                 # wait_idle() считают очередь свободной только когда
                 # пауза (в том числе долгого каста) реально прошла.
-                if cmd[0] == "execute_combo":
+                if skipped_cd:
+                    self._interruptible_sleep(random.uniform(0.03, 0.08))
+                elif cmd[0] == "execute_combo":
+                    self._combo_active = False          # клавиша скилла отпущена; дальше — пауза анимации
                     cast_time_s = cmd[2] if len(cmd) > 2 else None
                     task_cut_gen = cmd[3] if len(cmd) > 3 else self._cut_gen
                     if cast_time_s is not None:
@@ -1690,6 +1996,46 @@ class InputManager:
                 # task_done() в finally: при ошибке выше счётчик всё равно
                 # уменьшится, иначе wait_idle() завис бы навсегда.
                 self._queue.task_done()
+
+    # --- Скилл на откате: не жать вслепую (2026-10-09, лог 23:41:12) ---
+    # Цепочка жала "8" (каст 5 с), а слот был на откате: нажатие впустую, и бот 5.3 с СТОЯЛ в
+    # "паузе каста". Теперь перед нажатием спрашиваем панель скиллов (skill_ready_fn, ставит бот
+    # из skill_check): на откате -> НЕ жмём и паузу каста не ждём, сразу следующий шаг.
+    # Скилл на откате -> в КОНЕЦ очереди (к тому времени откат часто кончается); второй раз на
+    # откате -> выбрасываем (просьба 2026-10-10: "скилл в КД пусть идёт последним").
+    # Повтор ТОЙ ЖЕ клавиши подряд ("2 2 2" — скилл из нескольких ударов) не проверяем: после
+    # первого удара слот темнеет, хотя следующий удар доступен (лог 00:55:13: второй и третий
+    # удар "2" считались "на откате").
+    skill_ready_fn = None            # callable(action) -> True / False / None (не знаю)
+    _COMBO_CONTINUE_S = 2.0          # та же клавиша не позже этого после прошлой — продолжение комбо
+    _last_combo_key = None
+    _last_combo_at = float("-inf")
+
+    _CD_DEFER_MAX_AGE_S = 4.0        # перенесённый скилл старше этого — уже не жмём
+
+    def _defer_if_on_cd(self, cmd) -> bool:
+        """True — скилл сейчас на откате: перенесли в конец очереди или выбросили (без паузы каста)."""
+        fn = self.skill_ready_fn
+        actions = cmd[1]
+        if fn is None or len(actions) != 1 or not actions[0].startswith("press_"):
+            return False
+        key = actions[0][6:]
+        if key == self._last_combo_key and time.monotonic() - self._last_combo_at < self._COMBO_CONTINUE_S:
+            return False                                 # следующий удар того же скилла — жмём
+        try:
+            ready = fn(actions[0])
+        except Exception:
+            return False
+        if ready is not False:
+            return False
+        meta = cmd[5] if len(cmd) > 5 else None          # (время первой постановки, уже переносили?)
+        born, deferred = meta if meta is not None else (time.monotonic(), False)
+        if deferred or time.monotonic() - born > self._CD_DEFER_MAX_AGE_S:
+            input_debug_logger.debug("PRESS   %s пропуск: снова на откате — выбрасываю", key)
+            return True
+        input_debug_logger.debug("PRESS   %s на откате — переношу в конец очереди", key)
+        self._queue.put(tuple(cmd[:5]) + ((born, True),))
+        return True
 
     def _do_press_button(self, action: str) -> None:
         # Если паника пришла ДО нажатия — отпускать нечего, просто выходим.
@@ -1861,7 +2207,75 @@ class InputManager:
             self._camera_hold.clear()
             input_debug_logger.debug("CLICK   %s, Alt отпущен", "готово" if self.last_click_ok else "отменён")
 
-    def _click_strafe_start(self) -> "str | None":
+    _SELECT_REACTION_S = (0.0, 0.02)  # ТУРБО-2 2026-10-05: было (0.01, 0.03)
+    _SELECT_TO_ATTACK_S = (0.03, 0.06)  # ТУРБО-2 2026-10-05: было (0.04, 0.09)
+    _SELECT_STRAFE = True                  # выбор цели на ходу: A/D зажаты до самого E
+    _SELECT_RELEASE_TO_ATTACK_S = (0.005, 0.02)  # ТУРБО-2 2026-10-05: было (0.01, 0.03)
+    _SELECT_ATTACK_REPEATS = (1, 2)              # сколько раз ДОПОЛНИТЕЛЬНО жать E после выбора (итого 2-3)
+    _SELECT_ATTACK_REPEAT_GAP_S = (0.07, 0.14)   # пауза между нажатиями серии
+
+    def _do_select_target(self, index: int, attack_key: str) -> None:
+        key = "f%d" % index
+        if key not in self.INPUT_MAP or attack_key not in self.INPUT_MAP:
+            logger.error("InputManager: нет клавиши выбора цели %s или атаки %s", key, attack_key)
+            return
+        self.last_click_ok = False
+        if not self._interruptible_sleep(random.uniform(*self._SELECT_REACTION_S)):
+            return
+        # Выбираем цель НА ХОДУ (просьба 2026-10-05: "бот останавливается, чтобы выбрать цель"):
+        # стрейф от фразы движения уже зажат — держим его; нет — зажимаем A/D сами. Через F и
+        # до самого E персонаж идёт вбок; перед E стрейф отпускается (ниже), иначе он оборвал
+        # бы автобег к цели.
+        if self._SELECT_STRAFE:
+            self._click_strafe_start(p=1.0)
+        input_debug_logger.debug("SELECT  %s (строка %d списка) -> %s", key.upper(), index, attack_key.upper())
+        hold_s = random.uniform(*self._TARGET_TAP_HOLD_MS) / 1000.0
+        if not self._down(key):
+            return
+        try:
+            self._interruptible_sleep(hold_s)
+        finally:
+            self._up(key)
+        if not self._interruptible_sleep(random.uniform(*self._SELECT_TO_ATTACK_S)):
+            return
+        with self._io_lock:
+            released = [v for kind, v in list(self._held) if kind == "key" and v in self._CLICK_RELEASE_KEYS]
+            for v in released:
+                self._backend.key_up(v)
+                self._held.discard(("key", v))
+        if released:
+            input_debug_logger.debug("SELECT  перед %s отпустил %s", attack_key.upper(), "+".join(sorted(released)))
+            if not self._interruptible_sleep(random.uniform(*self._SELECT_RELEASE_TO_ATTACK_S)):
+                return
+        if not self._down(attack_key):
+            return
+        with self._io_lock:
+            # Как у клика по списку: дальше персонаж бежит к цели сам — движение не трогаем.
+            self.clicks_pressed += 1
+            self._click_guard_until = time.monotonic() + self._CLICK_MOVE_GUARD_S
+        try:
+            self._interruptible_sleep(random.uniform(*self._HOLD_KEY_MS) / 1000.0)
+        finally:
+            self._up(attack_key)
+        self.last_click_ok = True
+        # E ещё раз-два подряд (просьба 2026-10-06: "пусть атака жмётся несколько раз"): первое
+        # нажатие игра иногда не принимает (рамка выбора ещё не встала) — тогда персонаж не бежит.
+        # Повтор той же атаки по той же цели безвреден, а паузы — как у человека, "добивающего" клавишу.
+        for _ in range(random.randint(*self._SELECT_ATTACK_REPEATS)):
+            if not self._interruptible_sleep(random.uniform(*self._SELECT_ATTACK_REPEAT_GAP_S)):
+                return
+            if not self._down(attack_key):
+                return
+            try:
+                self._interruptible_sleep(random.uniform(*self._HOLD_KEY_MS) / 1000.0)
+            finally:
+                self._up(attack_key)
+        with self._io_lock:
+            self._click_guard_until = time.monotonic() + self._CLICK_MOVE_GUARD_S   # сторож — от ПОСЛЕДНЕГО E
+        input_debug_logger.debug("SELECT  %s нажата серией", attack_key.upper())
+
+    def _click_strafe_start(self, p: "float | None" = None) -> "str | None":
+        if getattr(self, "_chat_locked", False): return None
         """
         Перед Alt: если стрейф ещё не зажат (его мог зажать поток движения) — с вероятностью
         _CLICK_STRAFE_P зажать A или D и чуть "разогнаться" (человек сначала пошёл вбок,
@@ -1870,12 +2284,13 @@ class InputManager:
         with self._io_lock:
             if any(("key", k) in self._held for k in ("a", "d")):
                 return None                       # уже стрейфим (фраза движения) — держим как есть
-            if self._abort_event.is_set() or random.random() >= self._CLICK_STRAFE_P:
+            if self._abort_event.is_set() or random.random() >= (self._CLICK_STRAFE_P if p is None else p):
                 return None
             key = random.choice(("a", "d"))
+            self._injected_at[key] = time.monotonic()
             self._backend.key_down(key)
             self._held.add(("key", key))
-        input_debug_logger.debug("CLICK   стрейф %s, пока веду мышь к цели", key.upper())
+        input_debug_logger.debug("STRAFE  %s, пока выбираю цель", key.upper())
         self._interruptible_sleep(random.uniform(*self._CLICK_STRAFE_LEAD_S))
         return key
 
@@ -1903,7 +2318,40 @@ class InputManager:
         input_debug_logger.debug("=== COMBO START %s ===", actions)
 
         for action in actions:
+            if getattr(self, "_chat_locked", False):
+                break
             verb, _, target = action.partition("_")
+
+            if verb == "holdfor":
+                # "holdfor_<сек>_<клавиша>" — ЗАЖАТЬ скилл на заданное время (тип действия
+                # "Зажатие клавиши" в приложении, 2026-10-10): зарядка/канал, который идёт,
+                # пока клавиша держится. Движение на это время стоит (как при касте).
+                sec_s, _, key = target.partition("_")
+                try:
+                    hold_s = float(sec_s)
+                except ValueError:
+                    hold_s = 0.0
+                if key not in self.INPUT_MAP or hold_s <= 0:
+                    input_debug_logger.debug("SKIP    неверный шаг зажатия '%s'", action)
+                    continue
+                # Человек держит не до миллисекунды: +0..0.15 с сверху (раньше отпускать нельзя —
+                # заряд оборвётся).
+                hold_s += random.uniform(0.0, 0.15)
+                t_press = time.monotonic()
+                if not self._down(key):
+                    continue
+                self._casting_until = t_press + hold_s
+                input_debug_logger.debug("PRESS   %s (down, держу %.1f с — зажатие)", key, hold_s)
+                try:
+                    self._interruptible_sleep(hold_s)
+                finally:
+                    self._up(key)
+                    self._casting_until = 0.0
+                input_debug_logger.debug("PRESS   %s (up)", key)
+                pressed = True
+                if not held_here:
+                    self.skill_presses.append((key, t_press))
+                continue
 
             if target not in self.INPUT_MAP or verb not in ("press", "hold", "release"):
                 logger.error("InputManager: неизвестный шаг комбо '%s' — пропущен.", action)
@@ -1919,8 +2367,11 @@ class InputManager:
                 held_here.discard(target)
                 input_debug_logger.debug("RELEASE %s", target)
             else:  # press
+                t_press = time.monotonic()
                 self._tap(target)
                 pressed = True
+                if not held_here:                 # с модификатором (Shift+1) на панели другой слот — не проверяем
+                    self.skill_presses.append((target, t_press))
 
             gap_s = random.uniform(*self._COMBO_STEP_DELAY_S)
             if not self._interruptible_sleep(gap_s):
@@ -1972,6 +2423,7 @@ class InputManager:
         ctrl = _AimController(self._AIM_TUNING, self._CAMERA_INVERT_Y)
         scan = _ScanController(self._SCAN_TUNING)
         sweep_v, sweep_rem = 0.0, 0.0              # плавный разворот: скорость и дробные px
+        pitch_rem = 0.0                            # дробные счётчики жеста калибровки наклона
         last_seq = -1
         was_engaged = False
         was_scanning = False
@@ -2051,13 +2503,38 @@ class InputManager:
                     input_debug_logger.debug("SCAN    %s", scan.snapshot())
                     next_scan_log_at = now + 1.0
 
-                if step_x or step_y:
-                    try:
-                        with self._io_lock:
-                            self._backend.mouse_move_rel(step_x, step_y)
+                try:
+                    with self._io_lock:
+                        pitch = self._pitch
+                        # Коридор наклона: вниз ниже границы не пускаем, несделанное регулятор
+                        # забирает себе (cancel_y) — иначе он "думал" бы, что довернул.
+                        lim_y = pitch.allowed(step_y)
+                        if lim_y != step_y:
+                            ctrl.cancel_y(step_y - lim_y)
+                            if pitch.blocked_down:
+                                self.pitch_blocked_at = time.monotonic()
+                        # Калибровка — только без цели: при захвате обрываем (точка отсчёта не нужна
+                        # ценой потерянного моба, повторим позже).
+                        cal_y = 0
+                        if pitch.calibrating:
+                            if engaged:
+                                pitch.abort_calibration()
+                                pitch_rem = 0.0
+                                input_debug_logger.debug("PITCH   калибровка прервана: есть цель")
+                            else:
+                                pitch_rem += pitch.calib_step(dt)
+                                cal_y = int(pitch_rem)
+                                pitch_rem -= cal_y
+                                if not pitch.calibrating:
+                                    input_debug_logger.debug("PITCH   наклон выставлен: %.0f° от нижнего упора",
+                                                             (pitch.p or 0.0) / pitch.k)
+                        out_y = lim_y + cal_y
+                        if step_x or out_y:
+                            self._backend.mouse_move_rel(step_x, out_y)
                             self._yaw_counts += step_x
-                    except Exception as e:
-                        logger.error("InputManager: ошибка движения камеры: %s", e)
+                            pitch.applied(out_y)
+                except Exception as e:
+                    logger.error("InputManager: ошибка движения камеры: %s", e)
 
                 if engaged and now >= next_log_at:
                     input_debug_logger.debug("AIM     %s", ctrl.snapshot())
@@ -2291,3 +2768,4 @@ if __name__ == "__main__":
         print("Вызовы клавиш/кнопок:", other)
         print("Движений мыши: %d, суммарно dx=%d" % (len(moves), sum(c[1] for c in moves)))
     print("Песочница завершена.")
+

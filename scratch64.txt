@@ -1,0 +1,20 @@
+    # держат остальные проверки: две чёрные линии ровно в 11 px, правая граница и
+    # малиновая кнопка X с крестиком.
+    xa, xb = x_left + 2, x_right - 1
+    if yt - 1 < 0 or yb + 1 >= h:
+        return _fail("окантовка рамки вне ROI")
+    top = frame[max(0, yt - T.BEIGE_ROWS):yt, xa:xb]
+    bottom = frame[yb + 1:min(h, yb + 1 + T.BEIGE_ROWS), xa:xb]
+    if _beige_band_fraction(top) < T.BEIGE_FRACTION_MIN:
+        return _fail("нет бежевой окантовки сверху")
+    bottom_frac = _beige_band_fraction(bottom)
+    # Низ частично закрыт строкой "цель цели" (имя другого игрока) — допускаем, но тогда
+    # кнопка X обязана найтись (см. BEIGE_BOTTOM_FRACTION_MIN).
+    weak_bottom = bottom_frac < T.BEIGE_FRACTION_MIN
+    if bottom_frac < getattr(T, "BEIGE_BOTTOM_FRACTION_MIN", T.BEIGE_FRACTION_MIN):
+        return _fail("нет бежевой окантовки снизу")
+
+    # --- 4) Кнопка X ------------------------------------------------------
+    px0 = x_right + T.PLATE_DX_FROM
+    px1 = min(x_right + T.PLATE_DX_TO + 1, w)
+    plate_checked = (px1 - px0) >= T.PLATE_MIN_COLUMNS

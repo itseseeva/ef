@@ -2,10 +2,12 @@
 src/core/vision/vision_manager.py
 """
 
+import copy
 import os
 import sys
 import time
 import logging
+import threading
 from dataclasses import dataclass
 
 import cv2
@@ -16,11 +18,244 @@ import numpy as np
 # чтобы абсолютный импорт 'src.config' работал при прямом запуске файла.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 from src.config import aim_config, panel_template, vision_config
-from src.core.vision.panel_detector import PanelResult, read_panel
-from src.core.vision.target_list import TargetList, read_target_list
+from src.core.vision.frame_source import FrameSource
+from src.core.vision.panel_detector import (PanelResult, locate_panel, read_panel, read_panel_tinted,
+                                            scaled_template)
+
+# --- Яркость панели цели (2026-10-11, кадры друга) ---------------------------------------------
+# У друга игра намного светлее: чёрная рамка полоски HP — 44 вместо 4-11, кнопка X — R 150-170 вместо
+# 40-80. Пороги цвета детектора сняты на экране автора, и панель не узнавалась ("нет малиновой плашки
+# кнопки X"). Лечим не порогами, а кривой яркости (гамма, таблица LUT): кадр затемняется к эталону, и
+# все проверки работают как есть. На 184 кадрах друга: гамма 1.0 — 0 находок, 1.8-2.2 — 177-182, HP
+# совпадает с текстом панели (98.3% при 13 676/13 957). Гамму бот подбирает сам (см. калибровку ниже).
+# Кандидаты — по проверке на кадрах: 1.4 у друга почти не помогает (4/184), а у автора даёт ложные
+# находки; 1.8 и 2.2 — друг 177-182/184, у автора ложных 0-1 из 23 кадров-промахов.
+PANEL_GAMMAS = (1.0, 1.8, 2.2)
+_GAMMA_LUTS: "dict[float, np.ndarray]" = {}
+
+
+def gamma_lut(g: float) -> np.ndarray:
+    """Таблица 256 значений: v -> 255 * (v/255)^g. Применение cv2.LUT — доли мс на зону панели."""
+    lut = _GAMMA_LUTS.get(g)
+    if lut is None:
+        lut = _GAMMA_LUTS[g] = np.clip(255.0 * (np.arange(256) / 255.0) ** g, 0, 255).astype(np.uint8)
+    return lut
+
+
+def apply_gamma(frame: np.ndarray, g: float) -> np.ndarray:
+    return frame if g == 1.0 or frame is None else cv2.LUT(frame, gamma_lut(g))
+from src.core.vision.target_list import (REF_H, REF_W, TargetList, has_native_templates, locate_list,
+                                         read_target_list, refine_geometry, warp_to_reference)
 from src.core.vision import world_numbers
 
 logger = logging.getLogger(__name__)
+# Тот же логгер, что у бота (input_debug.log): находки панели списка видно рядом со строками LIST.
+_debug_log = logging.getLogger("input_debug")
+
+
+class ListLocator:
+    """
+    Фоновый поиск панели списка целей на всём экране (target_list.locate_list).
+
+    Почему поток: поиск по всему экрану в 14 масштабах — 40-120 мс. В главном цикле это
+    микрофриз на 3-7 кадров при 60 FPS; в фоне главный цикл его не замечает (OpenCV
+    отпускает GIL на время matchTemplate/resize). Поток спит на Event и просыпается только
+    по request() — когда список пропал; в обычной работе он не ест ни такта.
+
+    У потока СВОЙ экземпляр mss: mss не потокобезопасен (внутри — дескрипторы окна
+    Windows, привязанные к потоку), общий self.sct из двух потоков = редкие падения.
+
+    Как проверить без игры: ListLocator.search(cv2.imread("скрин.png")) — то же самое
+    синхронно, на скриншоте.
+    """
+
+    def __init__(self, monitor: dict) -> None:
+        self._monitor = dict(monitor)
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._result: "tuple | None" = None
+        self._busy = False
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, name=type(self).__name__, daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def search(frame: "np.ndarray | None") -> "tuple[int, int, float, float] | None":
+        return locate_list(frame)
+
+    def _search_frame(self, frame: np.ndarray) -> tuple:
+        r = locate_list(frame)
+        return (("found", self._monitor["left"] + r[0], self._monitor["top"] + r[1], r[2], r[3], r[4])
+                if r is not None else ("none",))
+
+    def request(self) -> None:
+        """Попросить поиск (неблокирующе). Уже ищем — повтор не ставим."""
+        if not self._busy:
+            self._event.set()
+
+    def take(self) -> "tuple | None":
+        """Результат последнего поиска (один раз): ("found", x, y, scale, score, precise) / ("none",) / None."""
+        with self._lock:
+            r, self._result = self._result, None
+        return r
+
+    def stop(self) -> None:
+        self._stop = True
+        self._event.set()
+
+    def _run(self) -> None:
+        sct = None
+        try:
+            while True:
+                self._event.wait()
+                self._event.clear()
+                if self._stop:
+                    return
+                self._busy = True
+                try:
+                    if sct is None:
+                        sct = mss.mss()
+                    frame = np.array(sct.grab(self._monitor))[..., :3]
+                    res = self._search_frame(frame)
+                except Exception as e:             # поток не должен умирать: следующая попытка через пару секунд
+                    logger.error("ListLocator: ошибка поиска панели: %s", e)
+                    res = ("none",)
+                finally:
+                    self._busy = False
+                with self._lock:
+                    self._result = res
+        finally:
+            if sct is not None:
+                sct.close()
+
+
+class PanelLocator(ListLocator):
+    """
+    То же для ПАНЕЛИ ЦЕЛИ (HP моба): фоновый поиск по всему экрану (panel_detector.locate_panel,
+    ~20-40 мс), когда в своей зоне её нет, а цель, судя по списку, выбрана. Игрок может
+    перетащить панель куда угодно (скрин 2026-10-05 21:40: левый верхний угол) — бот найдёт.
+    Результат: ("found", left, top) зоны панели на экране / ("none",).
+    Как проверить без игры: panel_detector.locate_panel(cv2.imread("полный_скриншот.png")).
+    """
+
+    def __init__(self, monitor: dict, roi_w: int, roi_h: int) -> None:
+        self._roi_w, self._roi_h = int(roi_w), int(roi_h)
+        # Масштаб интерфейса (VisionManager.panel_scale) — ставит главный поток перед request();
+        # float присваивается атомарно, блокировка не нужна.
+        self.scale = 1.0
+        super().__init__(monitor)
+
+    def _search_frame(self, frame: np.ndarray) -> tuple:
+        s = self.scale
+        g0 = getattr(self, "gamma", 1.0)
+        # Сначала текущая гамма, потом остальные: на светлом экране (у друга) панель находится только
+        # после затемнения. Фоновый поток — главный цикл эти ~10 мс на попытку не ждёт.
+        for g in (g0,) + tuple(x for x in PANEL_GAMMAS if x != g0):
+            r = locate_panel(apply_gamma(frame, g), int(round(self._roi_w * s)), int(round(self._roi_h * s)), scale=s)
+            if r is not None:
+                return ("found", self._monitor["left"] + r[0], self._monitor["top"] + r[1], g)
+        return ("none",)
+
+
+# Поля "последнего кадра мира", которые читают из главного потока (номера над мобами, кто под
+# прицелом, чёрный ящик). Фоновый поиск пишет их в СВОЮ тень, в главный объект они попадают
+# одним махом в world_async_take() — внутри тика бота кадр и полоски всегда из одного замера.
+_WORLD_PUB = ("last_world_frame", "last_bar_candidates", "last_marked_bars", "_last_ref",
+              "last_candidate_count", "last_marked_count")
+
+
+class WorldWorker:
+    """
+    Поиск полосок мобов (get_target_info по зоне 1407x589) — в фоновом потоке.
+
+    Почему (лог 2026-10-05 20:43, PERF 33-40 мс/тик): этот поиск — 20-40 мс, самая тяжёлая
+    часть тика. В главном цикле он раз в 0.1 с "съедал" целый тик: список целей читался реже,
+    реакция на смерть/выбор цели запаздывала. В потоке его не ждёт никто: главный цикл берёт
+    готовый результат, когда он есть. OpenCV (inRange, connectedComponents, Canny) отпускает
+    GIL (глобальную блокировку интерпретатора), так что потоки реально работают параллельно.
+
+    Тень (copy.copy главного VisionManager): поиск пишет память о баре, кадр и кандидатов в
+    свою копию, а не в главный объект, который в это же время читает главный поток, —
+    гонок нет без единой блокировки на чтение. Память "за кем следим" (_last_bar_center)
+    перед каждым замером берётся из главного: сбросы/захваты бара делает FSM.
+
+    Как проверить без игры: list_click_test.py / perf_timing_test.py — блок WA (фейковый
+    mss со скриншотом; запрос -> take() отдаёт тот же TargetInfo, что синхронный вызов).
+    """
+
+    def __init__(self, vision: "VisionManager") -> None:
+        self._main = vision
+        self._shadow = copy.copy(vision)
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._req: "tuple | None" = None
+        self._result: "tuple | None" = None
+        self._pending = False
+        self._stop = False
+        self.runs = 0
+        self.run_s = 0.0
+        self._thread = threading.Thread(target=self._run, name="WorldVision", daemon=True)
+        self._thread.start()
+
+    def request(self, roi: dict, kwargs: dict, key) -> None:
+        """Попросить замер (неблокирующе). Новый запрос заменяет ещё не начатый старый."""
+        with self._lock:
+            self._req = (dict(roi), dict(kwargs), key)
+            self._pending = True
+        self._event.set()
+
+    def pending(self) -> bool:
+        """Запрос принят и ещё считается — новый пока не ставим."""
+        return self._pending
+
+    def take(self) -> "tuple | None":
+        """Готовый результат (один раз) или None."""
+        with self._lock:
+            r, self._result = self._result, None
+        return r
+
+    def stats_take(self) -> "tuple[int, float]":
+        with self._lock:
+            r = (self.runs, self.run_s)
+            self.runs, self.run_s = 0, 0.0
+        return r
+
+    def stop(self) -> None:
+        self._stop = True
+        self._event.set()
+
+    def _run(self) -> None:
+        while True:
+            self._event.wait()
+            self._event.clear()
+            if self._stop:
+                return
+            with self._lock:
+                req, self._req = self._req, None
+                if req is None:
+                    self._pending = False
+                    continue
+            roi, kw, key = req
+            m, s = self._main, self._shadow
+            gen0 = m._track_gen
+            s._last_bar_center, s._lock_lost_since = m._last_bar_center, m._lock_lost_since
+            s._panel_roi_override = getattr(m, "_panel_roi_override", None)   # где панель (её маскируем)
+            t0 = time.monotonic()
+            res = None
+            try:
+                info = s.get_target_info(roi, **kw)
+                snap = {n: getattr(s, n) for n in _WORLD_PUB}
+                res = (key, t0, info, snap, gen0, (s._last_bar_center, s._lock_lost_since))
+            except Exception as e:                  # поток не должен умирать: следующий запрос — новая попытка
+                logger.error("WorldWorker: ошибка поиска полосок: %s", e)
+            dt = time.monotonic() - t0
+            with self._lock:
+                if res is not None:
+                    self._result = res
+                self.runs += 1
+                self.run_s += dt
+                if self._req is None:
+                    self._pending = False
 
 
 @dataclass
@@ -43,6 +278,10 @@ class TargetInfo:
     # панель; мировой бар и тестовые заглушки его не заполняют). По умолчанию None:
     # старый код и фейки, строившие TargetInfo из четырёх полей, продолжают работать.
     hp_text: "object | None" = None
+    # Панель: полоска HP серая — моба бьёт другой игрок (panel_detector.PanelResult.foreign).
+    foreign: bool = False
+    # Панель: выбран ИГРОК, а не моб (panel_detector.PanelResult.player).
+    player: bool = False
 
 
 class VisionManager:
@@ -179,11 +418,30 @@ class VisionManager:
     _STUCK_TO_MARKED_GAP_PX = 10
     _STUCK_TO_MARKED_DY_PX = 30
 
+    # Бот проверяет "is True": мок-зрение старых тестов (с __getattr__) фонового поиска не умеет.
+    supports_async_world = True
+
     def __init__(self) -> None:
         self._load_config()
         self.sct = mss.mss()
+        # mss на Windows держит дескрипторы окна в потоке, где создан: из другого потока
+        # (фоновый поиск полосок) — свой экземпляр, см. _sct_here().
+        self._sct_owner = threading.get_ident()
+        self._tls = threading.local()
+        # Счётчик сбросов/захватов бара из FSM: фоновый замер, начатый ДО сброса, свою память
+        # о баре в главный объект уже не пишет (см. world_async_take).
+        self._track_gen = 0
+        self._world_worker: "WorldWorker | None" = None
+        # Сколько главный поток провёл в захвате экрана (для строки PERF бота).
+        self._cap_n = 0
+        self._cap_s = 0.0
 
         monitor        = self.sct.monitors[1]
+        self._monitor  = dict(monitor)
+        # Один поток снимает весь монитор (DXGI), зоны — вырезки из последнего кадра
+        # (src/core/vision/frame_source.py). Недоступен — _capture снимает по-старому (mss).
+        self._frames = FrameSource(self._monitor)
+        self._frames.start()
         self.center_x  = monitor["left"] + monitor["width"]  // 2
         self.center_y  = monitor["top"]  + monitor["height"] // 2
         # Размер экрана нужен для перевода долей из aim_config в пиксели.
@@ -257,6 +515,17 @@ class VisionManager:
             getattr(vision_config, "MINIMAP_WIDTH", 228), getattr(vision_config, "MINIMAP_HEIGHT", 162),
         )
         self.last_target_list: TargetList = TargetList(False, reason="ещё не читали")
+        # Масштаб панели списка в игре (1.0 = 100%) и автопоиск панели (ListLocator):
+        # игрок может сдвинуть/уменьшить панель — бот найдёт её сам (2026-10-05).
+        self.list_scale = 1.0
+        # Угол зоны (дробные px экрана) и "уточнён ли по полоскам строк" (см. refine_geometry).
+        self._list_geo = (float(self.list_roi["left"]), float(self.list_roi["top"]), 1.0)
+        self._list_sub = (0.0, 0.0)
+        self._list_precise = True
+        self._list_locator: "ListLocator | None" = None
+        self._list_missing_since: "float | None" = None
+        self._list_next_locate_at = 0.0
+        self._list_located_once = False
 
         logger.debug(
             "VisionManager инициализирован. Центр экрана: (%d, %d)",
@@ -283,6 +552,7 @@ class VisionManager:
         """
         self._last_bar_center = None
         self._lock_lost_since = None
+        self._track_gen = getattr(self, "_track_gen", 0) + 1
         self._panel_miss_streak = 0
         self._last_panel_info = None
 
@@ -296,6 +566,7 @@ class VisionManager:
         """
         self._last_bar_center = None
         self._lock_lost_since = None
+        self._track_gen = getattr(self, "_track_gen", 0) + 1
 
     @property
     def bar_locked(self) -> bool:
@@ -347,8 +618,12 @@ class VisionManager:
         Мутирует frame IN PLACE (без возврата копии) — лишняя аллокация
         полного кадра 60 раз в секунду того не стоит.
         """
-        panel_left = (self.center_x + self._panel_offset_x) - roi_coords["left"]
-        panel_top = (self.center_y + self._panel_offset_y) - roi_coords["top"]
+        ov = getattr(self, "_panel_roi_override", None)      # панель перетащили (PanelLocator)
+        s = self._panel_scale_raw()                       # фоновый поток: без побочных эффектов
+        if ov is None and s != 1.0:
+            ov = self._panel_roi_guess(s)
+        panel_left = (ov["left"] if ov else self.center_x + self._panel_offset_x) - roi_coords["left"]
+        panel_top = (ov["top"] if ov else self.center_y + self._panel_offset_y) - roi_coords["top"]
 
         # Клип к границам кадра — если при будущей перекалибровке панель
         # окажется ЧАСТИЧНО или ПОЛНОСТЬЮ вне мировой зоны, маска должна
@@ -356,8 +631,8 @@ class VisionManager:
         # отрицательном/слишком большом срезе.
         x0 = max(0, panel_left)
         y0 = max(0, panel_top)
-        x1 = min(frame.shape[1], panel_left + self._panel_width)
-        y1 = min(frame.shape[0], panel_top + self._panel_height)
+        x1 = min(frame.shape[1], panel_left + int(self._panel_width * s))
+        y1 = min(frame.shape[0], panel_top + int(self._panel_height * s))
 
         if x1 > x0 and y1 > y0:
             frame[y0:y1, x0:x1] = 0
@@ -375,11 +650,162 @@ class VisionManager:
 
     # --- Список целей (Астральное зрение) ---
 
+    # Список пропал дольше стольких секунд -> ищем панель по всему экрану (в фоне), не чаще
+    # раза в _LIST_LOCATE_EVERY_S: если игрок просто закрыл список, поиск идёт редко и в фоне.
+    _LIST_LOCATE_AFTER_S = 1.0
+    _LIST_LOCATE_EVERY_S = 3.0
+
     def get_target_list(self) -> TargetList:
-        """Захват зоны списка (~420x194, доли мс) + разбор строк (1-3 мс)."""
-        tl = read_target_list(self._capture(self.list_roi))
+        """
+        Захват зоны списка (~420x194, доли мс) + разбор строк (1-3 мс). Панель не на месте
+        (сдвинули/изменили размер) -> фоновый ListLocator находит её, зона и масштаб
+        обновляются здесь же, в главном потоке (никаких гонок с захватом).
+        """
+        now = time.monotonic()
+        self._list_apply_located()
+        scale = getattr(self, "list_scale", 1.0)
+        ox, oy = getattr(self, "_list_sub", (0.0, 0.0))
+        frame = self._capture_padded(self.list_roi)
+        self.last_list_frame = frame                      # для чёрного ящика (событие list_pick)
+        tl = read_target_list(warp_to_reference(frame, ox, oy, scale), scale)
+        if not tl.visible and not getattr(self, "_list_located_once", False) \
+                and not getattr(self, "_list_sync_tried", False):
+            # Самый первый промах (старт бота, панель не на месте из конфига): ищем её СРАЗУ,
+            # в этом же вызове (~0.1 с один раз), а не ждём фонового поиска — иначе первые
+            # секунды бот выбирает цели "на глаз" (лог 2026-10-05 18:24:52).
+            self._list_sync_tried = True
+            found = self._list_locate_now()
+            if found:
+                scale = self.list_scale
+                ox, oy = self._list_sub
+                frame = self._capture_padded(self.list_roi)
+                self.last_list_frame = frame
+                tl = read_target_list(warp_to_reference(frame, ox, oy, scale), scale)
+        if tl.visible and tl.rows and not getattr(self, "_list_precise", True) and frame is not None:
+            # Нашли по шапке (+-2 px), а теперь есть строки: уточняем по их полоскам (~1 мс, один раз).
+            fine = refine_geometry(frame, ox, oy, scale)
+            if fine is not None:
+                gx, gy, gs = self.list_roi["left"] + fine[0], self.list_roi["top"] + fine[1], fine[2]
+                self._set_list_geometry(gx, gy, gs, True)
+                self._log_list_geometry("уточнена по строкам", gx, gy, gs, None)
         self.last_target_list = tl
+        self._list_watch(tl, now)
         return tl
+
+    @property
+    def list_search_pending(self) -> bool:
+        """Панель списка ещё ни разу не находили (старт): бот подождёт её, прежде чем искать "на глаз"."""
+        return not getattr(self, "_list_located_once", False)
+
+    def _list_locate_now(self) -> bool:
+        """Синхронный поиск панели списка на всём мониторе (главный поток, ~0.1 с). True — нашли."""
+        mon = getattr(self, "_monitor", None)
+        if mon is None:
+            return False
+        try:
+            full = np.array(self.sct.grab(mon))[..., :3]
+            r = locate_list(full)
+        except Exception as e:
+            logger.error("VisionManager: поиск панели списка при старте: %s", e)
+            return False
+        if r is None:
+            _debug_log.debug("LIST    при старте панель списка не нашлась — ищу дальше в фоне")
+            return False
+        x, y, scale, score, precise = r
+        x, y = mon["left"] + x, mon["top"] + y
+        self._set_list_geometry(x, y, scale, precise)
+        self._list_located_once = True
+        self._log_list_geometry("найдена при старте" + ("" if precise else " (грубо, по шапке)"), x, y, scale, score)
+        self._warn_list_covers_panel()
+        return True
+
+    def _set_list_geometry(self, x: float, y: float, scale: float, precise: bool) -> None:
+        """Угол зоны (дробный) и масштаб -> зона захвата (целые px с запасом 1 px) + сдвиг внутри неё."""
+        if abs(scale - 1.0) < 1e-6 and float(x).is_integer() and float(y).is_integer():
+            left, top, w, h = int(x), int(y), REF_W, REF_H         # 100%: ровно как раньше, без warp
+        else:
+            left, top = int(np.floor(x)) - 1, int(np.floor(y)) - 1
+            w = int(np.ceil(x + REF_W * scale)) + 1 - left
+            h = int(np.ceil(y + REF_H * scale)) + 1 - top
+        self.list_roi = {"left": left, "top": top, "width": w, "height": h}
+        self.list_scale = float(scale)
+        self._list_geo = (float(x), float(y), float(scale))
+        self._list_sub = (float(x) - left, float(y) - top)
+        self._list_precise = precise
+
+    def _log_list_geometry(self, what: str, x: float, y: float, scale: float, score: "float | None") -> None:
+        msg = "LIST    панель списка %s: x=%.1f y=%.1f, масштаб %.2f%%%s" % (
+            what, x, y, scale * 100, "" if score is None else " (совпадение шапки %.2f)" % score)
+        _debug_log.debug(msg)
+        logger.info(msg)
+
+    def _list_locator_get(self) -> "ListLocator | None":
+        loc = getattr(self, "_list_locator", None)
+        if loc is None and hasattr(self, "_monitor"):
+            loc = self._list_locator = ListLocator(self._monitor)   # лениво: поток — только когда нужен
+        return loc
+
+    def _list_watch(self, tl: TargetList, now: float) -> None:
+        """Список не виден -> попросить фоновый поиск панели (сразу при старте, дальше редко)."""
+        if tl.visible:
+            self._list_missing_since = None
+            self._list_located_once = True
+            return
+        since = getattr(self, "_list_missing_since", None)
+        if since is None:
+            self._list_missing_since = since = now
+        first = not getattr(self, "_list_located_once", False)
+        if not first and now - since < self._LIST_LOCATE_AFTER_S:
+            return
+        if now < getattr(self, "_list_next_locate_at", 0.0):
+            return
+        loc = self._list_locator_get()
+        if loc is not None:
+            self._list_next_locate_at = now + self._LIST_LOCATE_EVERY_S
+            loc.request()
+
+    def _list_apply_located(self) -> None:
+        """Забрать находку фонового поиска: новая зона и масштаб (если панель правда сдвинулась)."""
+        loc = getattr(self, "_list_locator", None)
+        r = loc.take() if loc is not None else None
+        if r is None or r[0] != "found":
+            return
+        _, x, y, scale, score, precise = r
+        self._list_located_once = True
+        ox, oy, osc = getattr(self, "_list_geo", (self.list_roi["left"], self.list_roi["top"], self.list_scale))
+        if abs(ox - x) < 0.6 and abs(oy - y) < 0.6 and abs(osc - scale) < 0.003:
+            if precise and not getattr(self, "_list_precise", True):
+                self._list_precise = True
+            return
+        self._set_list_geometry(x, y, scale, precise)
+        self._log_list_geometry("найдена" + ("" if precise else " (грубо, по шапке)"), x, y, scale, score)
+        if abs(scale - 1.0) >= 0.015 and not has_native_templates(scale):
+            # Игра рисует шрифт под размер панели сама: растянутые 100%-образцы на нём путают
+            # цифры (на 94% "72 м" читалось как "55 м", 2026-10-05). Образцы этого размера
+            # надо снять один раз (см. list_digit_samples/ и tools/check_hud.py).
+            warn = ("LIST    ВНИМАНИЕ: размер списка %.1f%% — образцов цифр для него нет, метры могут "
+                    "читаться неверно. Пришли скриншоты списка с разными метрами — сниму образцы." % (scale * 100))
+            _debug_log.debug(warn)
+            logger.warning(warn)
+        self._warn_list_covers_panel()
+
+    def _warn_list_covers_panel(self) -> None:
+        """
+        Список закрывает панель цели (HP моба)? Тогда бот не видит выбранную цель, не входит в
+        бой и не жмёт комбо (лог 2026-10-05 15:50: "нет бежевой окантовки сверху" при выбранном
+        мобе). Сам бот это не исправит — панели двигает игрок; пишем понятное предупреждение.
+        """
+        pr = self.panel_roi
+        lr = self.list_roi
+        # Пересечение прямоугольников: по x и по y отрезки перекрываются (шапка вкладок — верх списка).
+        ox = min(pr["left"] + pr["width"], lr["left"] + lr["width"]) - max(pr["left"], lr["left"])
+        oy = min(pr["top"] + pr["height"], lr["top"] + lr["height"]) - max(pr["top"], lr["top"])
+        if ox > 10 and oy > 10:
+            msg = ("LIST    ВНИМАНИЕ: список целей перекрывает панель цели (HP моба, x=%d y=%d) на %d px — "
+                   "бот не увидит выбранного моба и не начнёт бой. Сдвинь список ниже/в сторону."
+                   % (pr["left"], pr["top"], oy))
+            _debug_log.debug(msg)
+            logger.warning(msg)
 
     def get_minimap(self) -> "np.ndarray | None":
         """Кадр миникарты (BGR, ~228x162) для одометра. Захват ~1 мс; бот зовёт ~5 раз/с."""
@@ -441,8 +867,9 @@ class VisionManager:
         return world_numbers.number_window(self.last_world_frame, bar)
 
     def list_point_to_screen(self, pt: "tuple[float, float]") -> "tuple[float, float]":
-        """Точка в координатах зоны списка -> пиксели экрана (для клика)."""
-        return self.list_roi["left"] + pt[0], self.list_roi["top"] + pt[1]
+        """Точка в координатах зоны списка (при 100%) -> пиксели экрана (для клика)."""
+        x, y, k = getattr(self, "_list_geo", (self.list_roi["left"], self.list_roi["top"], 1.0))
+        return x + pt[0] * k, y + pt[1] * k
 
     # --- Точка прицела (см. src/config/aim_config.py) ---
 
@@ -575,6 +1002,12 @@ class VisionManager:
         зона). Поля заполнены только для единообразия TargetInfo и
         отладочных логов.
         """
+        # Панель могли перетащить в другое место экрана (см. PanelLocator): тогда читаем там.
+        self._panel_apply_located()
+        if self.panel_scale != 1.0:
+            roi_coords = self.panel_roi            # зона бота (_panel_roi) — в эталонных пикселях
+        else:
+            roi_coords = getattr(self, "_panel_roi_override", None) or roi_coords
         raw = self._scan_panel_once(roi_coords)
 
         if raw.found:
@@ -583,8 +1016,11 @@ class VisionManager:
             # случай, если следующий кадр(ы) окажутся шумом.
             self._panel_miss_streak = 0
             self._last_panel_info = raw
+            self._panel_miss_since = None
             return raw
 
+        self._panel_watch(time.monotonic(), roi_coords)
+        self._panel_gamma_calibrate(time.monotonic())
         # Кадр без находки. Не доверяем ему немедленно — считаем подряд
         # идущие пропуски и сравниваем с порогом из конфига.
         self._panel_miss_streak += 1
@@ -606,6 +1042,153 @@ class VisionManager:
         self._last_panel_info = None
         return raw
 
+    # Поиск панели цели по экрану (PanelLocator): цель в списке выбрана, а панели в зоне нет
+    # столько — ищем (и не чаще раза в ...). Без выбранной цели в списке — редко: панель могли
+    # сдвинуть, а список выключен (выбор целей зрением).
+    _PANEL_LOCATE_SELECTED_S = (0.25, 0.8)
+    _PANEL_LOCATE_IDLE_S = (2.0, 3.0)
+    # Находка ближе стольких px к текущей зоне — это она же (панель на месте, просто не видна).
+    _PANEL_MOVE_MIN_PX = 3
+    # Запас зоны панели при захвате (px по X, по Y) — см. _scan_panel_once.
+    _PANEL_PAD = (40, 30)
+    # Сколько после последней обычной находки панели верим "той же рамке под вспышкой".
+    _PANEL_TINT_MEMORY_S = 3.0
+
+    def _panel_watch(self, now: float, roi: dict) -> None:
+        """Панели нет в её зоне -> фоновый поиск по экрану (см. PanelLocator)."""
+        if not hasattr(self, "_monitor"):
+            return
+        since = getattr(self, "_panel_miss_since", None)
+        if since is None:
+            self._panel_miss_since = since = now
+        tl = getattr(self, "last_target_list", None)
+        selected = tl is not None and getattr(tl, "visible", False) and getattr(tl, "selected_row", None) is not None
+        wait, every = self._PANEL_LOCATE_SELECTED_S if selected else self._PANEL_LOCATE_IDLE_S
+        if now - since < wait or now < getattr(self, "_panel_next_locate_at", 0.0):
+            return
+        loc = getattr(self, "_panel_locator", None)
+        if loc is None:
+            loc = self._panel_locator = PanelLocator(self._monitor, roi["width"], roi["height"])
+        self._panel_next_locate_at = now + every
+        loc.scale = self.panel_scale
+        loc.gamma = getattr(self, "_panel_gamma", 1.0)
+        loc.request()
+
+    def _panel_apply_located(self) -> None:
+        """Забрать находку PanelLocator: панель на новом месте -> зона панели теперь там."""
+        loc = getattr(self, "_panel_locator", None)
+        r = loc.take() if loc is not None else None
+        if r is None or r[0] != "found":
+            return
+        if len(r) > 3:
+            self._panel_gamma_vote(float(r[3]), "поиск панели по экрану")
+        cur = self.panel_roi
+        x, y = int(r[1]), int(r[2])
+        if abs(cur["left"] - x) < self._PANEL_MOVE_MIN_PX and abs(cur["top"] - y) < self._PANEL_MOVE_MIN_PX:
+            return
+        self._panel_roi_override = {"left": x, "top": y, "width": cur["width"], "height": cur["height"]}
+        self._panel_miss_since = None
+        msg = "PANEL   панель цели найдена на новом месте: x=%d y=%d (была x=%d y=%d)" % (
+            x, y, cur["left"], cur["top"])
+        _debug_log.debug(msg)
+        logger.info(msg)
+        if hasattr(self, "list_roi"):
+            self._warn_list_covers_panel()
+
+    # Масштаб интерфейса для панели цели (2026-10-11, лог друга: 2560x1440, интерфейс в ~1.28 раза
+    # крупнее — панель не узнавалась, бот не входил в бой). Меряем его по списку целей: его размер
+    # бот уже находит сам (масштаб шапки), а эталон панели снят при списке PANEL_REF_LIST_SCALE.
+    # Разница меньше _PANEL_SCALE_DEADBAND — считаем 1.0: у автора всё ровно как раньше.
+    _PANEL_SCALE_DEADBAND = 0.06
+
+    def _panel_scale_raw(self) -> float:
+        """Масштаб без побочных эффектов — можно звать из фонового потока (мировой поиск)."""
+        if not getattr(self, "_list_located_once", False):
+            return 1.0                                    # список ещё не мерили — эталон
+        ref = float(getattr(vision_config, "PANEL_REF_LIST_SCALE", 0.925))
+        s = float(getattr(self, "list_scale", 1.0)) / ref
+        return 1.0 if abs(s - 1.0) < self._PANEL_SCALE_DEADBAND else round(s, 2)
+
+    @property
+    def panel_scale(self) -> float:
+        """Масштаб для главного потока: при смене — сброс найденной зоны и строка в лог."""
+        s = self._panel_scale_raw()
+        if s != getattr(self, "_panel_scale_seen", 1.0):
+            # Масштаб сменился: старая найденная зона и "последняя рамка" — в чужих пикселях.
+            self._panel_scale_seen = s
+            self._panel_roi_override = None
+            self._panel_last_bar = None
+            msg = "PANEL   масштаб интерфейса для панели цели: x%.2f (список %.1f%%)" % (s, self.list_scale * 100)
+            _debug_log.debug(msg)
+            logger.info(msg)
+        return s
+
+    # Калибровка гаммы: цель в списке выбрана, а панели нет уже столько кадров подряд (вспышки и
+    # моргания короче — не повод), не чаще раза в _GAMMA_TRY_S; смена гаммы — только после
+    # _GAMMA_CONFIRM находок одной и той же гаммой на РАЗНЫХ кадрах (защита от случайного совпадения).
+    _GAMMA_MISS_FRAMES = 10
+    _GAMMA_TRY_S = 1.0
+    _GAMMA_CONFIRM = 3
+
+    def _panel_gamma_calibrate(self, now: float) -> None:
+        tl = getattr(self, "last_target_list", None)
+        if tl is None or not getattr(tl, "visible", False) or getattr(tl, "selected_row", None) is None:
+            return
+        if self._panel_miss_streak < self._GAMMA_MISS_FRAMES or now < getattr(self, "_gamma_next_try", 0.0):
+            return
+        frame = getattr(self, "last_panel_frame", None)
+        if frame is None:
+            return
+        self._gamma_next_try = now + self._GAMMA_TRY_S
+        cur = getattr(self, "_panel_gamma", 1.0)
+        s = self.panel_scale
+        expect = getattr(self, "_panel_expect_y", None)
+        for g in PANEL_GAMMAS:                    # до 4 попыток по ~2-3 мс, раз в секунду и только при пропусках
+            if g == cur:
+                continue
+            if read_panel(apply_gamma(frame, g), scale=s, expect_y=expect).ok:
+                self._panel_gamma_vote(g, "калибровка по зоне панели")
+                return
+
+    def _panel_gamma_vote(self, g: float, where: str) -> None:
+        cur = getattr(self, "_panel_gamma", 1.0)
+        if g == cur:
+            self._gamma_cand = None
+            return
+        cand, n = getattr(self, "_gamma_cand", None) or (None, 0)
+        n = n + 1 if cand == g else 1
+        self._gamma_cand = (g, n)
+        if n < self._GAMMA_CONFIRM:
+            return
+        self._panel_gamma = g
+        self._gamma_cand = None
+        self._panel_last_bar = None
+        msg = "PANEL   яркость экрана: панель цели читаю с гаммой %.1f (было %.1f; %s)" % (g, cur, where)
+        _debug_log.debug(msg)
+        logger.info(msg)
+
+    def _panel_roi_guess(self, s: float) -> dict:
+        """Где панель при масштабе s, пока PanelLocator её не нашёл: эталонная точка (снята на
+        1920x1080) от ЛЕВОГО ВЕРХНЕГО угла x s — панель цели в игре прижата к углу (лог друга:
+        от центра 2560x1440 она оказывалась не там). Размер — эталонный, его умножает скан."""
+        mon = getattr(self, "_monitor", {"left": 0, "top": 0})
+        rx = 960 + int(vision_config.TARGET_PANEL_OFFSET_X)
+        ry = 540 + int(vision_config.TARGET_PANEL_OFFSET_Y)
+        return {"left": int(mon["left"] + round(rx * s)), "top": int(mon["top"] + round(ry * s)),
+                "width": int(vision_config.TARGET_PANEL_WIDTH), "height": int(vision_config.TARGET_PANEL_HEIGHT)}
+
+    @property
+    def panel_roi(self) -> dict:
+        """Зона панели цели на экране: найденная поиском (PanelLocator) или из vision_config."""
+        ov = getattr(self, "_panel_roi_override", None)
+        if ov is not None:
+            return ov
+        s = self.panel_scale
+        if s != 1.0:
+            return self._panel_roi_guess(s)
+        return self.build_roi(vision_config.TARGET_PANEL_OFFSET_X, vision_config.TARGET_PANEL_OFFSET_Y,
+                              vision_config.TARGET_PANEL_WIDTH, vision_config.TARGET_PANEL_HEIGHT)
+
     def _scan_panel_once(self, roi_coords: dict) -> TargetInfo:
         """
         Один СЫРОЙ, без антидребезга, скан зоны панели цели. Вынесен из
@@ -626,13 +1209,48 @@ class VisionManager:
         """
         empty = TargetInfo(found=False, hp_percent=0.0, offset_x=0.0, offset_y=0.0)
 
-        frame = self._capture(roi_coords)
+        # Зона с запасом со всех сторон (2026-10-06, "Дворф-рубака"): у элитных мобов панель другой
+        # формы — выше и левее обычной; в зону 190x90 она влезала обрезанной (начало полоски за
+        # левым краем), и бот терял живую цель. Детектор ищет рамку в любом месте кадра.
+        px, py = getattr(self, "_PANEL_PAD", (0, 0))
+        # Интерфейс крупнее эталона (панель в s раз больше): зона и запас — в s раз больше, картинку
+        # НЕ уменьшаем (тонкие линии рамки при пересчёте пикселей размываются), а детектору говорим
+        # масштаб — он сам умножит свои пиксельные числа (см. panel_detector.scaled_template).
+        s = self.panel_scale
+        px, py = int(round(px * s)), int(round(py * s))
+        roi_coords = {"left": roi_coords["left"] - px, "top": roi_coords["top"] - py,
+                      "width": int(round(roi_coords["width"] * s)) + 2 * px,
+                      "height": int(round(roi_coords["height"] * s)) + 2 * py}
+        frame = self._capture_padded(roi_coords, fill=128)
         if frame is None:
             self.last_panel_result = None
             return empty
         self.last_panel_frame = frame
 
-        result = read_panel(frame)
+        # Быстрый путь (подсказка, где рамка) — только у масштабированного/затемнённого чтения:
+        # у автора (масштаб 1, гамма 1) детектор работает ровно как раньше.
+        g = getattr(self, "_panel_gamma", 1.0)
+        expect = None
+        if s != 1.0 or g != 1.0:
+            expect = py + (scaled_template(s).PANEL_LINE_Y_IN_ROI if s != 1.0 else panel_template.PANEL_LINE_Y_IN_ROI)
+        self._panel_expect_y = expect
+        frame = apply_gamma(frame, g)            # last_panel_frame остался сырым — для калибровки и чёрного ящика
+        result = read_panel(frame, scale=s, expect_y=expect)
+        now = time.monotonic()
+        if result.ok:
+            self._panel_last_bar = (result.bar, now)
+        else:
+            # Только что панель была здесь, а теперь "нет" — возможно, игра залила экран красной
+            # вспышкой (лог 23:01:12: бот бросил моба с 11% HP). Проверяем то же место по B,G.
+            lb = getattr(self, "_panel_last_bar", None)
+            if lb is not None and now - lb[1] <= self._PANEL_TINT_MEMORY_S:
+                tinted = read_panel_tinted(frame, lb[0], scale=s)
+                if tinted.ok:
+                    result = tinted
+                    if not getattr(self, "_tint_logged", False):
+                        self._tint_logged = True
+                        _debug_log.debug("PANEL   панель под красной вспышкой — читаю её по прежнему месту (HP %.0f%%)",
+                                         tinted.hp_percent)
         self.last_panel_result = result
         if not result.ok:
             return empty
@@ -660,6 +1278,8 @@ class VisionManager:
             offset_x=bar_center_x - roi_center_x,
             offset_y=bar_center_y - roi_center_y,
             hp_text=result.text,
+            foreign=getattr(result, "foreign", False),
+            player=getattr(result, "player", False),
         )
 
     def _collect_bar_candidates(self, frame: "np.ndarray") -> "list[tuple[int,int,int,int]]":
@@ -1000,6 +1620,7 @@ class VisionManager:
         """Взять липкий захват на конкретный бар (его дальше ведёт get_target_info)."""
         self._last_bar_center = (c[0] + c[2] / 2, c[1] + c[3] / 2)
         self._lock_lost_since = None
+        self._track_gen = getattr(self, "_track_gen", 0) + 1
 
     def crosshair_target(self, radius_px: float) -> str:
         """
@@ -1031,15 +1652,124 @@ class VisionManager:
             return "none"
         return "marked" if best in self.last_marked_bars else "other"
 
+    def _sct_here(self):
+        """mss этого потока: главный — self.sct, любой другой (фоновый поиск) — свой, ленивый."""
+        if threading.get_ident() == getattr(self, "_sct_owner", None) or not hasattr(self, "_tls"):
+            return self.sct
+        s = getattr(self._tls, "sct", None)
+        if s is None:
+            s = self._tls.sct = mss.mss()
+        return s
+
     def _capture(self, roi_coords: dict) -> np.ndarray | None:
+        # Для PERF считаем захват потока бота (он не обязательно тот, где создан VisionManager),
+        # а фоновый поиск полосок — нет: у него своя строка в PERF.
+        main = threading.current_thread().name != "WorldVision" and hasattr(self, "_cap_n")
+        t0 = time.perf_counter() if main else 0.0
         try:
-            raw = self.sct.grab(roi_coords)
+            fs = getattr(self, "_frames", None)
+            if fs is not None:
+                fr = fs.crop(roi_coords)
+                if fr is not None:
+                    return fr                         # вырезка из кадра DXGI — доли мс вместо 5-7
+            raw = self._sct_here().grab(roi_coords)
             return np.array(raw)[..., :3]
         except Exception as e:
             logger.error("VisionManager: ошибка захвата экрана: %s", e)
             return None
+        finally:
+            if main:
+                self._cap_n += 1
+                self._cap_s += time.perf_counter() - t0
+
+    def _capture_padded(self, roi: dict, fill: "int | None" = None) -> "np.ndarray | None":
+        """
+        Захват зоны, которая может выходить за край экрана (панель прижата к краю, скрин
+        2026-10-05 21:40: зона списка с x=-4): снимаем только видимую часть, недостающее —
+        повтором крайних пикселей (как warp_to_reference). Целиком на экране -> обычный захват.
+        """
+        mons = getattr(self.sct, "monitors", None)
+        try:
+            vs = mons[0]
+            if not isinstance(vs, dict):
+                return self._capture(roi)
+            vx0, vy0 = int(vs["left"]), int(vs["top"])
+            vx1, vy1 = vx0 + int(vs["width"]), vy0 + int(vs["height"])
+        except Exception:                               # мок-mss без monitors — как раньше
+            return self._capture(roi)
+        l, t = int(roi["left"]), int(roi["top"])
+        r, b = l + int(roi["width"]), t + int(roi["height"])
+        cl, ct, cr, cb = max(l, vx0), max(t, vy0), min(r, vx1), min(b, vy1)
+        if (cl, ct, cr, cb) == (l, t, r, b):
+            return self._capture(roi)
+        if cr <= cl or cb <= ct:
+            return None
+        part = self._capture({"left": cl, "top": ct, "width": cr - cl, "height": cb - ct})
+        if part is None:
+            return None
+        if fill is not None:                            # нейтральный серый: не продлевает чёрные линии рамки
+            return cv2.copyMakeBorder(np.ascontiguousarray(part), ct - t, b - cb, cl - l, r - cr,
+                                      cv2.BORDER_CONSTANT, value=(fill, fill, fill))
+        return cv2.copyMakeBorder(np.ascontiguousarray(part), ct - t, b - cb, cl - l, r - cr, cv2.BORDER_REPLICATE)
+
+    # --- Фоновый поиск полосок мобов (см. WorldWorker) ---
+
+    def world_async_request(self, roi: dict, kwargs: dict, key) -> None:
+        """Заказать замер get_target_info(roi, **kwargs) в фоне. key — метка режима (вернётся с результатом)."""
+        if self._world_worker is None:
+            self._world_worker = WorldWorker(self)
+        self._world_worker.request(roi, kwargs, key)
+
+    def world_async_busy(self) -> bool:
+        w = self._world_worker
+        return w is not None and w.pending()
+
+    def world_async_take(self, key, newer_than: float) -> "TargetInfo | None":
+        """
+        Свежий фоновый замер под этот режим (key) и снятый не раньше newer_than -> TargetInfo,
+        и его кадр/полоски публикуются в этот объект (их читают номера над мобами и прицел).
+        Нет нового / чужой режим / снят до смерти прошлой цели -> None.
+        """
+        w = self._world_worker
+        res = w.take() if w is not None else None
+        if res is None:
+            return None
+        rkey, t0, info, snap, gen0, track = res
+        if rkey != key or t0 < newer_than:
+            return None
+        for name, val in snap.items():
+            setattr(self, name, val)
+        if gen0 == self._track_gen:
+            # Сброс/захват бара из FSM, пришедший во время замера, важнее памяти тени.
+            self._last_bar_center, self._lock_lost_since = track
+        return info
+
+    def perf_take(self) -> dict:
+        """Для строки PERF: захват экрана в главном потоке и фоновые замеры мира с прошлого вызова."""
+        n, s = self._cap_n, self._cap_s
+        self._cap_n, self._cap_s = 0, 0.0
+        w = self._world_worker
+        wn, ws = w.stats_take() if w is not None else (0, 0.0)
+        out = {"cap_n": n, "cap_s": s, "world_n": wn, "world_s": ws}
+        fs = getattr(self, "_frames", None)
+        if fs is not None:
+            out["dxgi_n"], out["dxgi_s"] = fs.stats_take()
+            out["dxgi_off"] = fs.disabled_reason
+        return out
 
     def close(self) -> None:
+        fs = getattr(self, "_frames", None)
+        if fs is not None:
+            fs.stop()
+        loc = getattr(self, "_list_locator", None)
+        if loc is not None:
+            loc.stop()
+        w = getattr(self, "_world_worker", None)
+        if w is not None:
+            w.stop()
+        ploc = getattr(self, "_panel_locator", None)
+        if ploc is not None:
+            ploc.stop()
         self.sct.close()
         logger.debug("VisionManager закрыт.")
 

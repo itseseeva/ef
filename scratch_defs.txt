@@ -1,0 +1,110 @@
+def _ou_step(value: float, theta: float, sigma: float, dt: float) -> float:
+def __init__(self, tuning: AimTuning, invert_y: bool = False) -> None:
+def reset(self) -> None:
+def _reset_adapt(self, adaptive: bool) -> None:
+def begin(self, now: float) -> None:
+def _reroll_amp(self, now: float) -> None:
+def _cum_at(self, when: float) -> "tuple[float, float]":
+def measure(self, dx: float, dy: float, t_meas: float, now: float, adaptive: bool = False,
+def _update_r(self, i: int, moved: float, turned: float) -> None:
+def step(self, dt: float, engaged: bool, now: float) -> "tuple[int, int]":
+def cancel_y(self, counts: int) -> None:
+def freeze(self) -> None:
+def snapshot(self) -> str:
+def __init__(self, tuning: ScanTuning) -> None:
+def reset(self) -> None:
+def running(self) -> bool:
+def _begin(self) -> None:
+def _start_sweep(self) -> None:
+def _start_pause(self) -> None:
+def _quantize(self, fx: float, fy: float) -> "tuple[int, int]":
+def step(self, dt: float, active: bool) -> "tuple[int, int]":
+def cancel_y(self, counts: int) -> None:
+def freeze(self) -> None:
+def snapshot(self) -> str:
+def _build_scancodes() -> "dict[str, tuple[int, bool]]":
+def __init__(self) -> None:
+def key_down(self, key: str) -> None:
+def key_up(self, key: str) -> None:
+def _send_key(self, key: str, up: bool) -> None:
+def mouse_button(self, button: str, down: bool) -> None:
+def mouse_move_rel(self, dx: int, dy: int) -> None:
+def cursor_pos(self) -> "tuple[int, int]":
+def cursor_visible(self) -> "bool | None":
+def mouse_move_abs(self, x: float, y: float) -> None:
+def mouse_wheel(self, delta: int) -> None:
+def _send_mouse(self, flags: int, dx: int = 0, dy: int = 0, data: int = 0) -> None:
+def __init__(self) -> None:
+def key_down(self, key: str) -> None:
+def key_up(self, key: str) -> None:
+def mouse_button(self, button: str, down: bool) -> None:
+def mouse_move_rel(self, dx: int, dy: int) -> None:
+def cursor_pos(self) -> "tuple[float, float]":
+def cursor_visible(self) -> "bool | None":
+def mouse_move_abs(self, x: float, y: float) -> None:
+def mouse_wheel(self, delta: int) -> None:
+def _build_input_map() -> "dict[str, tuple[str, str] | None]":
+def tune_windows_timing() -> "list[str]":
+def __init__(self, backend=None) -> None:
+def press_button(self, action: str) -> None:
+def aim_with_stick(self, dx: float, dy: float, adaptive: bool = False, gentle: bool = False) -> None:
+def clear_aim_target(self) -> None:
+def start_scan(self) -> None:
+def stop_scan(self) -> None:
+def start_sweep(self) -> None:
+def stop_sweep(self) -> None:
+def move_camera_rel(self, dx: int, dy: int) -> None:
+def zoom_out(self, notches: int) -> None:
+def select_target(self, index: int, attack_key: str = "e") -> None:
+def attack_key(self, key: str = "e") -> None:
+def _do_attack_key(self, key: str) -> None:
+def click_at(self, x: float, y: float, button: str = "left", strafe: bool = False) -> None:
+def execute_combo(self, actions: "list[str]", cast_time_s: "float | None" = None,
+def execute_combo_now(self, actions: "list[str]", cast_time_s: "float | None" = None,
+def combo_done(self, tag: object) -> bool:
+def movement_key(self, name: str, down: bool) -> bool:
+def camera_nudge(self, dx: int, dy: int) -> bool:
+def calibrate_pitch(self) -> None:
+def pitch_state(self) -> "tuple[float | None, bool]":
+def camera_yaw_counts(self) -> int:
+def jump_allowed(self) -> bool:
+def movement_blocked(self) -> "str | None":
+def change_target(self, direction: str = "right") -> None:
+def flick_target(self, direction: str = "right") -> None:
+def move(self, direction: str, duration_s: float) -> None:
+def parse_combo_string(spec: str) -> "list[str]":
+def canonical_key(name: str) -> "str | None":
+def cancel_pending_actions(self, cut_current_wait: bool = False) -> None:
+def halt_immediately(self) -> None:
+def reset_abort(self) -> None:
+def stop(self) -> None:
+def wait_idle(self) -> None:
+def is_idle(self) -> bool:
+def _validate_direction(direction: str, who: str) -> None:
+def _drain_queue(self) -> None:
+def _interruptible_sleep(self, seconds: float) -> bool:
+def _sleep_gap(self, seconds: float, task_cut_gen: int) -> bool:
+def _down(self, name: str) -> bool:
+def injected_recently(self, key: str, window_s: float = 0.6) -> bool:
+def _up(self, name: str) -> None:
+def _release_all(self) -> None:
+def _tap(self, name: str) -> None:
+def _worker(self) -> None:
+def _do_press_button(self, action: str) -> None:
+def _do_tap_target(self, direction: str) -> None:
+def _do_zoom_out(self, notches: int) -> None:
+def _cursor_path(x0: float, y0: float, x1: float, y1: float, steps: int, bend: float) -> "list[tuple[float, float]]":
+def _move_cursor_human(self, x: float, y: float) -> bool:
+def _wait_cursor(self, visible: bool, timeout_s: float) -> bool:
+def _do_click_at(self, x: float, y: float, button: str = "left", strafe: bool = False) -> None:
+def _do_select_target(self, index: int, attack_key: str) -> None:
+def _click_strafe_start(self, p: "float | None" = None) -> "str | None":
+def _do_move(self, key: str, duration_s: float) -> None:
+def _do_execute_combo(self, actions: "list[str]") -> bool:
+def _read_aim_target(self) -> "tuple[float, float, bool, int, float, bool, bool, bool]":
+def _aim_worker(self) -> None:
+def _simulate_aim(
+def _simulate_orbit_turn(
+def screen_x(phi_deg: float) -> float:
+def _simulate_scan(
+def _summarize_trace(trace: "list[tuple[float, float, float]]", axis: int = 1) -> "tuple[float, float | None]":

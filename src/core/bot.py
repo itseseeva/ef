@@ -35,9 +35,17 @@ from src.core.movement import (MODE_APPROACH, MODE_COMBAT, MODE_OFF, MODE_ROAM, 
                                MovementController, load_hold_stats, load_phrases, load_turns)
 from src.core.navigation import Navigator, wrap180
 from src.core.skills_config import load_skills_config
+from src.core.skill_check import PressCheckLoop
+from src.core.vision.skill_bar import SLOTS as SKILL_BAR_SLOTS, SkillBarWatcher
 from src.core.vision import hp_text
+from src.core.rotation import PRIORITY_START_DELAY_S, PriorityRotation, WAIT
+from src.core.pull import GATHER as PULL_GATHER, KILL as PULL_KILL, RETURN as PULL_RETURN, PullPlanner, TagAttempt
+from src.core.vision_check import HINTS as VCHECK_HINTS, LIST as VCHECK_LIST, MAP as VCHECK_MAP, \
+    TITLES as VCHECK_TITLES, VisionCheck
+import threading
 from src.core.vision.vision_manager import VisionManager, TargetInfo
-from src.core.vision.target_list import format_list
+import dataclasses
+from src.core.vision.target_list import TargetList, format_list
 
 # Путь к конфигу скиллов ОТНОСИТЕЛЬНО этого файла (src/core/bot.py), а не
 # абсолютный и не от текущей рабочей директории — так бот стартует
@@ -194,14 +202,14 @@ class FarmBot:
     # статистически неестественный ритм, который EAC-анализ засекает
     # быстрее, чем сами нажатия. Живой игрок хотя бы долю секунды смотрит
     # на экран, прежде чем искать следующую цель.
-    _POST_KILL_DELAY = (0.05, 0.15)
+    _POST_KILL_DELAY = (0.005, 0.03)  # ТУРБО-2 2026-10-05: было (0.02, 0.06)
 
     # Пауза между первым ударом (ПКМ по выбранной цели, см. _handle_search)
     # и первой цепочкой скиллов. ПКМ запускает бег к цели и автоатаку; без
     # паузы скилл улетал бы в очередь сразу следом, пока персонаж ещё
     # стоит далеко от моба (скилл не достаёт / сбивает движение). Диапазон,
     # а не константа — та же анти-детект логика, что и у остальных пауз.
-    _FIRST_STRIKE_DELAY = (0.1, 0.25)
+    _FIRST_STRIKE_DELAY = (0.03, 0.07)  # ТУРБО-2 2026-10-05: было (0.05, 0.12)
 
     # ---- Фазы поиска цели (SearchPhase). Все времена — диапазоны (min, max):
     # одинаковые паузы от цикла к циклу — статистический отпечаток бота. ----
@@ -289,7 +297,7 @@ class FarmBot:
     _SWAP_SAMPLE_EVERY_S = 0.1     # период записи в историю
     _SWAP_MIN_SAMPLES = 5          # меньше (0.5 с истории) — эталона ещё нет
     _SWAP_LOCK_MIN_GAP_S = 1.0     # захват только что поставлен (идёт ~0.85 с) — второй не нужен
-    _RELOCK_GAP_S = 0.6            # панель пропадала столько и вернулась -> новая цель
+    _RELOCK_GAP_S = 0.4  # ТУРБО-2 2026-10-05: было 0.6 | панель пропадала столько и вернулась -> новая цель
 
     # РЕЖИМ ЗРЕНИЯ. True (по умолчанию) — ДВА окна зрения, как и задумано:
     #   * панель цели (маленькое окно) — единственный источник правды "цель
@@ -353,7 +361,12 @@ class FarmBot:
     # РЕАЛЬНОЙ смерти моба бот теперь просто ничего не делает лишнюю
     # секунду, прежде чем пойти искать следующего — не критично (лут
     # автоматический), просто чуть медленнее фарм в целом.
-    _TARGET_LOST_GRACE_S = 1.5
+    # 2026-10-05 ("сделай паузы быстрее, чтобы выглядел настоящее"): 1.5 -> 1.0 с. По логу
+    # 16:40-16:42 каждый килл стоил 1.52 с простоя (14 киллов = 21 с из 2.3 мин): HP мобов
+    # падает рывками, до 20% перед смертью панель почти не доходит, и быстрый вердикт не
+    # срабатывал. 1.0 с — всё ещё в 2.4 раза дольше замеренных морганий от удара (0.36-0.41 с).
+    # Моргания длиннее теперь пишутся в лог строкой BLINK — по ним можно ужать ещё.
+    _TARGET_LOST_GRACE_S = 0.45  # ТУРБО-2 2026-10-05: было 0.7
     # Быстрый вердикт (2026-10-03, скорость): если перед пропажей панели HP цели было
     # уже <= _FAST_KILL_MAX_HP, это почти наверняка смерть — ждём не 1.5 с, а
     # _FAST_KILL_GRACE_S (это всё ещё больше замеренных морганий панели 0.36-0.41 с).
@@ -363,8 +376,19 @@ class FarmBot:
     # 2026-10-04 (пункт "не добивает"): 30% / 0.6 с -> 20% / 0.7 с. В бою с эффектами панель
     # моргает дольше (в логе до 0.5-0.9 с), а при 25-30% моб ещё жив — короткий грейс
     # бросал его. Ниже 20% при моргании ждём 0.7 с, выше — обычные 1.5 с.
-    _FAST_KILL_MAX_HP = 20.0
-    _FAST_KILL_GRACE_S = 0.7
+    _FAST_KILL_MAX_HP = 1.0      # Включаем жесткий грейс только если ХП упало до 1%
+    _FAST_KILL_GRACE_S = 0.42  # ТУРБО-2 2026-10-05: было 0.45
+    # Пустая полоска (2026-10-06, "убрать микропаузы"): последний замер <= _DEAD_HP_MAX и
+    # предыдущий <= _DEAD_PREV_HP_MAX (два замера подряд у дна — не одиночный сбой чтения) ->
+    # грейс всего _DEAD_GRACE_S. Меньше нуля нельзя: один кадр без панели бывает и у живого.
+    _DEAD_HP_MAX = 0.5
+    _DEAD_PREV_HP_MAX = 8.0
+    _DEAD_GRACE_S = 0.15
+    # Быстрые правила "пустая полоска = мёртв" — ТОЛЬКО если мы видели эту цель живой (HP >= 3%)
+    # и видели, как HP упало (blackbox 2026-10-09 22:01, три случая подряд): бот брал моба с
+    # 125-307 из 13 957 HP (1-2%) — заливка 1-3 px прячется под левым краем полоски, читается 0%,
+    # и через 0.17 с бот объявлял "убит" и бросал моба, которому оставался один удар.
+    _ALIVE_SEEN_HP = 3.0
 
     # ---- СТРОГАЯ ПРОВЕРКА УБИЙСТВА (2026-10-02) ----
     # Баг по логу: панель цели пропала при HP 38.9% (камеру дёрнуло на чужой
@@ -448,7 +472,7 @@ class FarmBot:
     _ENGAGE_CONFIRM_S = 0.06
     _ENGAGE_BAR_DROP_PCT = 4.0
     _ENGAGE_BAR_CONFIRM_S = 0.40
-    _ENGAGE_FIRST_SKILL_DELAY = (0.10, 0.30)   # человеческая реакция между "попал" и первым скиллом
+    _ENGAGE_FIRST_SKILL_DELAY = (0.02, 0.06)  # ТУРБО-2 2026-10-05: было (0.04, 0.12)
     _ENGAGE_RETAB_EVERY_S = (4.7, 5.3)
     # После своего Tab панель переключается на новую цель, и её число отличается от
     # эталона — это НЕ урон. Столько секунд эталон просто перечитывается.
@@ -511,9 +535,9 @@ class FarmBot:
     # Бот кликает Alt+ЛКМ строку ближнего — персонаж сам бежит к нему, камеру крутить
     # не нужно. Поиск по экрану (_VISION_TARGETING) остаётся запасным: список пуст/закрыт.
     _LIST_TARGETING = True
-    _LIST_READ_EVERY_S = 0.15            # чаще читать незачем: игра обновляет список раз в 5-10 с
-    _LIST_REACTION_S = (0.06, 0.16)      # "заметил моба в списке" -> начал вести мышь (быстрее, 2026-10-04)
-    _LIST_CONFIRM_TIMEOUT_S = 2.2        # клик (~0.5-0.8 с) + рамка на строке; дольше — не вышло
+    _LIST_READ_EVERY_S = 0.08  # ТУРБО-2 2026-10-05: было 0.10
+    _LIST_REACTION_S = (0.01, 0.04)  # ТУРБО-2 2026-10-05: было (0.03, 0.08)
+    _LIST_CONFIRM_TIMEOUT_S = 1.4        # F+E (~0.2-0.3 с) + рамка на строке; дольше — не вышло (было 2.2)
     _LIST_BLACKLIST_S = 8.0              # номер строки, по которой не вышло / моб недосягаем
     _LIST_JITTER_PX = (28.0, 4.0)        # разброс точки клика по строке (x, y): не в одну точку
     _LIST_RUN_SPEED_MPS = 6.0            # скорость бега для оценки "успел добежать"
@@ -524,6 +548,8 @@ class FarmBot:
     # пока в кадре не появится наша цель (полоска с меткой выбора); дальше ведёт её мягко.
     _LIST_CAM_LOST_S = 1.0               # цель пропала из кадра дольше — снова плавный осмотр
     _LIST_CAM_SEARCH_MAX_S = 15.0        # ~1.5 оборота: не нашли — камеру оставляем в покое
+    _CAM_MELEE_WAIT_S = 1.5              # бой, цели в кадре нет дольше — разворачиваемся искать её
+    _CAM_MELEE_SWEEP_MAX_S = 8.0         # ...но крутим не дольше этого (~оборот), потом пауза
     # "Найти по номеру, вести по месту" (2026-10-04): номер нужен, только чтобы НАЙТИ своего
     # моба на экране; дальше бот ведёт ту же полоску от кадра к кадру по положению — игра
     # может перенумеровать мобов, цель от этого не меняется.
@@ -535,10 +561,49 @@ class FarmBot:
     _LP_STUCK_S = 4.0
     _LP_MIN_GAIN_M = 2
     _LP_MELEE_M = 5                      # ближе — уже у моба: даём 5 с на первый удар
-    _LP_HARD_CAP_S = 25.0                # предохранитель: столько без урона — смена в любом случае
+    _LP_HARD_CAP_S = 14.0                # предохранитель: столько без урона — смена в любом случае (было 25)
+    # Повтор атаки (лог 2026-10-05 17:01:18-43: F3+E нажаты, цель выбрана, но персонаж не побежал —
+    # E "съелась" в анимации прошлого скилла; строка цели потом пропала из списка, и бот 25 с
+    # стоял). До первого урона: метры до цели не падают (или их не видно) _ATTACK_RETRY_S после
+    # последнего E -> жмём E ещё раз; _ATTACK_RETRY_MAX раз подряд без толку -> другая цель.
+    _ATTACK_RETRY_S = (1.3, 1.8)
+    _ATTACK_RETRY_MAX = 3
+    _ATTACK_PROGRESS_M = 1               # метры упали хотя бы на столько — значит, бежим...
+    # ...и не медленнее этого (м/с). Бег персонажа 5-10 м/с; 1 м/с — это моб сам идёт к стоящему
+    # персонажу (лог 21:49:29-34: 15 -> 10 м за 5 с, бот считал это "бежим" и E не жал).
+    _ATTACK_RUN_MIN_MPS = 3.0
+    # Цель ДАЛЬШЕ дистанции удара (выученной, см. _ARRIVE_*), а метры не падают — персонаж точно
+    # стоит, а не замахивается: E ещё раз быстрее (лог 20:43:34-35: стоял 1.5 с на 21 м). Бег
+    # ~6 м/с, список ~10 раз/с: метр проходится за ~0.17 с, 0.55 с без метра — не бежим.
+    # 2026-10-06: было (0.45, 0.6). Бег после E стартует через 0.5-0.9 с (лог 03:53-04:02, 25 выборов):
+    # повтор E раньше этого перезапускал разгон, и персонаж стартовал ещё позже.
+    _ATTACK_RETRY_FAST_S = (0.8, 0.95)
+    # Дистанция удара ещё не выучена: дальше стольких метров — точно не замах, стоим зря.
+    _ATTACK_FAR_DEFAULT_M = 20
+
+    # "Дошёл до дистанции удара" (лог 2026-10-05 20:43): персонаж добегал до ~15 м и ещё 1.2-1.4 с
+    # стоял — замах первой автоатаки, — а ротация ждала, пока упадёт HP. Теперь бот учится, с
+    # какой дистанции бьёт персонаж (метры строки цели при первом настоящем уроне, медиана
+    # последних боёв), и открывает ротацию, как только метры цели дошли до неё: первый скилл
+    # идёт вместо долгого замаха. Сторож урона (_watch_damage) работает как прежде: не будет
+    # урона _ENGAGED_NO_DAMAGE_S — шлагбаум закроется. Стрейфы — всё так же после урона.
+    _ARRIVE_GATE_ENABLED = True
+    _ARRIVE_MIN_SAMPLES = 2              # столько боёв, прежде чем верить выученной дистанции
+    _ARRIVE_RAN_MIN_M = 3                # замер в учёбу — только если до удара пробежали хоть столько
+    _ARRIVE_AFTER_SELECT_S = 0.15        # список успевает показать метры новой цели
     # Выбранная цель посерела в списке (ушла далеко) до первого удара -> сразу смена. Ждём
     # столько подряд серых чтений, чтобы один кривой кадр (анимация списка) не сбил цель.
     _LP_FADED_CONFIRM_S = 0.4
+    # Ближайшая цель по метрам (просьба 2026-10-05: выбрана №1 в 39 м, а №2 в 7 м). Цель
+    # выбирается ближней, но пока бежим к ней (урона ещё нет), список меняется: игра сама
+    # берёт далёкого моба, мобы подходят, чёрный список истекает. Если другая строка ЗАМЕТНО
+    # ближе — переключаемся на неё. Оба порога сразу: "на 8 м" не даёт метаться между 12 и 9 м,
+    # "60% от текущей" — между 40 и 31 м. Бьём уже — цель не трогаем (бросить недобитого хуже).
+    _CLOSER_ENABLED = True
+    _CLOSER_MIN_GAIN_M = 5               # другая ближе хотя бы на столько метров... (было 8: 23 м vs 18 м
+    _CLOSER_MAX_RATIO = 0.8              # ...и не дальше 80% до текущей                 не менял — лог 16:09:41)
+    _CLOSER_CONFIRM_S = 0.18             # тот же кандидат в 2+ чтениях подряд: одна кривая цифра не сбивает
+    _CLOSER_COOLDOWN_S = 3.0             # после смены столько не меняем снова (без пинг-понга)
     _VT_FIRST_LOOK_S = (0.5, 0.9)   # сколько смотреть в кадр в начале поиска, прежде чем крутить камеру
     # Камера на максимальном отдалении (просьба 2026-10-04: "чтобы бот видел больше").
     # Первая прокрутка после старта — с запасом до упора (лишние щелчки на максимуме игра
@@ -557,9 +622,16 @@ class FarmBot:
     # Камера на цели "как человек" (2026-10-04): цель в кадре держим в удобной зоне у центра —
     # вышла за _CAM_ZONE_OUT ширины экрана -> через 0.10-0.25 с (реакция) доводим, пока не
     # войдёт в _CAM_ZONE_IN; внутри зоны камеру не трогаем (человек не центрирует до пикселя).
-    _CAM_ZONE_OUT = 0.10
-    _CAM_ZONE_IN = 0.03
-    _CAM_REACT_S = (0.10, 0.25)
+    # 2026-10-05 (жалоба "прицел часто не на цели"): зона уже — 5% / 1.5% ширины (~96 / ~29 px
+    # на Full HD), прицел держится +- на цели, а не "где-то в пятой части экрана".
+    _CAM_ZONE_OUT = 0.05
+    _CAM_ZONE_IN = 0.015
+    _CAM_REACT_S = (0.08, 0.20)
+    # Доводка на цель в кадре: False — плавный регулятор камеры (aim_with_stick, тот самый, что
+    # "работал идеально"); True — жесты из записи (2026-10-04). Жесты отключены: их "px на
+    # счётчик" училось на бегу и уплыло 2.0 -> 0.64 (лог 16:09-16:10) — каждый жест перелетал
+    # цель в 2-3 раза. Жесты остались для осмотра, когда цели в кадре нет.
+    _CAM_AIM_GESTURES = False
     # "Упор на цель" ЖЕСТАМИ ИЗ ЗАПИСИ (просьба 2026-10-04: "как при калибровке, но на цель"):
     # цель вышла из удобной зоны -> один жест руки ровно на нужный угол (как в прогулке),
     # потом короткий "взгляд" (проверить, где цель) и, если надо, ещё жест. Сколько экранных
@@ -571,7 +643,7 @@ class FarmBot:
     # Цели в кадре нет и куда бежим — неизвестно: осмотр ЖЕСТАМИ по 60-100° с паузами
     # "посмотреть" (вместо ровного механического разворота), не больше полного круга.
     _CAM_LOOK_STEP_DEG = (60.0, 100.0)
-    _CAM_LOOK_PAUSE_S = (0.30, 0.70)
+    _CAM_LOOK_PAUSE_S = (0.15, 0.35)  # ТУРБО 2026-10-05: было (0.30, 0.70)
     # Цели в кадре нет, а персонаж бежит к ней сам: поворачиваем камеру туда, куда он бежит
     # (направление бега — по миникарте), если расходимся больше чем на столько градусов.
     _CAM_FACE_TOL_DEG = 25.0
@@ -584,15 +656,58 @@ class FarmBot:
     # Стрейфы, пока бот ведёт мышь к строке списка (просьба 2026-10-04 "живее"). Перед самим
     # кликом InputManager отпускает их (клавиша в момент клика оборвала бы бег к цели).
     _SELECT_STRAFE_ENABLED = True
+    # Выбор цели БИНДАМИ (2026-10-05): в игре строки списка забиндены на F1-F8, атака — E.
+    # Бот жмёт F<номер строки>, потом E: мышь и Alt не нужны. False — по-старому Alt+ПКМ.
+    # Хоткеи приложения F4/F5/F6 нажатия бота пропускают (InputManager.injected_recently).
+    _TARGET_KEYS_ENABLED = True
+    _TARGET_ATTACK_KEY = "e"
+    # Возврат домой (2026-10-05): примерно раз в 3 минуты бот сам идёт к точке, где его запустили
+    # (по миникарте), по пути новых целей не берёт (но отбивается, если напали). Дошёл ближе
+    # _HOME_ARRIVE_M — дальше обычный фарм; не дошёл за _HOME_TIMEOUT_S — бросает и ждёт
+    # следующего раза.
+    _HOME_ENABLED = True
+    # Интервал (2026-10-12, просьба "раз в 3 минуты"): 3 мин +-15 с, а не ровно 180 — одинаковый
+    # промежуток между походами легко увидеть в логах сервера как паттерн бота (античит).
+    _HOME_EVERY_S = (165.0, 195.0)
+    _HOME_ARRIVE_M = 8.0
+    _HOME_TIMEOUT_S = 60.0
+    # "Резинка" (2026-10-12, лог: за 3 мин бот уполз на 65 м за мобами): ушёл дальше этого от
+    # дома — домой сразу, не дожидаясь таймера. Таймер остаётся страховкой.
+    _HOME_LEASH_M = 40.0
+    # Домой — бегом в шифте (Shift в игре — бег, просьба 2026-10-04). Если у тебя Shift — другое
+    # действие, поставь False.
+    _HOME_SPRINT = True
+    # Режим "пул" (ТЕСТ 2026-10-13, src/core/pull.py): сбор мобов тычками -> домой -> добивание у
+    # дома, чтобы лут падал у людей. Включается ТОЛЬКО переменной окружения EZF_PULL=1 — её ставит
+    # tools/pull_test.py; обычный бот и exe работают как раньше. Проверим — сделаем настройкой.
+    # Режим фарма (2026-10-20): по умолчанию — ПУЛ (тычки -> домой -> бой у дома, src/core/pull.py);
+    # "обычный" — бить всех подряд без агра. Выбирает переключатель в окне программы: app_launcher
+    # ставит bot.pull_mode перед каждым "Старт". Переменная EZF_PULL=1/0 — принудительно (тесты, откат).
+    _PULL_MODE = os.getenv("EZF_PULL", "1") != "0"
+    # Орлиное зрение (R) — обновление таблицы целей (2026-10-13: автообновление в игре выключено,
+    # обновляет бот). Без КД, срабатывает сразу; таблицу читаем через _EAGLE_WAIT_S.
+    _EAGLE_ENABLED = True
+    _EAGLE_KEY = "r"
+    _EAGLE_WAIT_S = 0.2
+    _EAGLE_IDLE_EVERY_S = (1.5, 2.5)
+    _PULL_TAG_DROP_PCT = 1.2     # HP цели упало на столько от входа в бой — тычка засчитана (не мерцание)
+    _PULL_AOE_OFF_S = 1.0        # куча у дома "рассыпалась" столько подряд — скиллы по площади больше не первые
+    _PULL_EAGLE_IDLE_MAX_S = 1.5         # R ждёт конца текущего нажатия не дольше (зажатие "8" — 6 с — не ждём)
+    _PULL_EAGLE_PRESS_MAX_S = 2.0        # R в очереди, а нажатия так и нет столько — считаем, что нажат
+    _PULL_CORPSE_S = 2.5                 # пул: HP 0% с выбора цели столько — это труп, а не "уже тычкнут"
+    _PULL_NEXT_WAIT_S = 1.5      # после тычки ищем следующего столько, прежде чем решить "некого — домой"
+    _RELOC_LOG_MIN_PX = 1.0      # сверка с домом: поправку меньше пикселя в лог не пишем
+    _RELOC_LOG_EVERY_S = 30.0    # ...но раз в 30 с — строка-подтверждение, что сверка жива
     # Бой на расстоянии (лог 2026-10-04 15:01:32-42): первый урон прошёл, когда моб был ещё в
     # 14 м, ротация открылась, ноги перешли в боевые стрейфы — а нажатия A/D обрывают автобег
     # игры к цели. Персонаж застрял в 17-19 м, скиллы не долетали, HP стояло на 58.9%, бот
     # "бил воздух" и ходил влево-вправо. Теперь:
-    #   - боевые шаги только когда моб рядом (по списку не дальше _COMBAT_MOVE_MAX_M), иначе
-    #     ноги не трогаем — персонаж добегает сам;
-    #   - моб дальше _REENGAGE_DIST_M дольше _REENGAGE_CONFIRM_S и урона нет -> кликаем его
-    #     строку в списке (Alt+ПКМ): игра снова ведёт персонажа к нему и бьёт.
-    _COMBAT_MOVE_MAX_M = 6
+    #   - боевые шаги — только когда автоатака УЖЕ бьёт (урон по цели после последнего
+    #     выбора F+E), без оглядки на метры: у дальнобойного персонажа урон идёт и с 20+ м
+    #     (2026-10-05, "у меня рендж большой и бот не стрейфится"). До первого урона ноги
+    #     не трогаем — персонаж добегает сам;
+    #   - моб дальше _REENGAGE_DIST_M дольше _REENGAGE_CONFIRM_S и урона нет -> снова F+E по
+    #     его строке: игра ведёт персонажа к нему, стрейфы ждут нового урона.
     _REENGAGE_DIST_M = 7
     _REENGAGE_CONFIRM_S = 0.8
     _REENGAGE_COOLDOWN_S = 3.0
@@ -604,7 +719,7 @@ class FarmBot:
     _MINIMAP_SAMPLES_MAX = 20
     _ZOOM_EVERY_S = (9.0, 11.0)
     _ZOOM_FIRST_NOTCHES = (15, 18)
-    _ZOOM_NOTCHES = (4, 6)
+    _ZOOM_NOTCHES = (2, 3)  # ТУРБО-2 2026-10-05: было (4, 6) — короче прокрутка = короче занята очередь ввода
     # После СВОЕГО Tab кадр этого тика ещё показывает метку на прежней цели: Tab
     # стоит в очереди. Столько ждём, чтобы зрение увидело новую метку.
     _SELECT_AFTER_TAB_S = 0.1
@@ -663,7 +778,10 @@ class FarmBot:
     # числом секунд в self._skills[i]['cooldown']/['last_used'], см.
     # __init__ и skills_config.json) — это отдельная, более короткая
     # пауза "не мешай текущему касту".
-    _SKILL_CAST_DELAY = (0.4, 0.8)
+    # Пауза FSM после запуска цепочки. Спам поверх анимации и так держит замок цепочки
+    # (_chain_busy: очередь пуста И прошёл min_end) — эта пауза лишь задерживала проверки
+    # ротации, в том числе вставку скилла "по своему КД" (2026-10-05: было (0.4, 0.8)).
+    _SKILL_CAST_DELAY = (0.03, 0.08)
 
     # ---- ЖЁСТКИЙ ЗАМОК ЦЕПОЧЕК (2026-10-02) ----
     # Правило: пока цепочка скиллов не доиграна до конца, НИ ОДНА другая цепочка
@@ -680,12 +798,12 @@ class FarmBot:
     #                    жмёт следующий скилл в тот же кадр, когда прошёл каст.
     # Нижняя оценка намеренно ЗАНИЖЕНА: завышение держало бы бота без дела.
     # Числа ниже должны быть не больше реальных таймингов InputManager
-    # (_COMBO_STEP_DELAY_S min = 0.03, _SKILL_CAST_GAP_BANDS_S min = 0.88,
+    # (_COMBO_STEP_DELAY_S min = 0.03, _SKILL_CAST_GAP_BANDS_S min = 0.70,
     # _CAST_GAP_JITTER min = 1.0).
     _CHAIN_MIN_ACTION_S = 0.03       # минимум на одно нажатие внутри скилла
-    _CHAIN_MIN_GAP_S = 0.88          # минимум паузы после скилла без заданного каста
+    _CHAIN_MIN_GAP_S = 0.77  # 2026-10-11: было 0.57 (просьба "делей 0.8") | минимум паузы после скилла (= нижняя граница _SKILL_CAST_GAP_BANDS_S)
     _CHAIN_CAST_GAP_FACTOR = 1.0     # пауза после долгого каста не короче каст * это
-    _CHAIN_TAIL_S = (0.15, 0.40)     # пауза после конца цепочки (диапазон — анти-паттерн)
+    _CHAIN_TAIL_S = (0.02, 0.06)  # ТУРБО-2 2026-10-05: было (0.04, 0.12)
     _CHAIN_WAIT_LOG_EVERY_S = 2.0    # как часто писать "цепочка готова, но замок держит"
     # ЗАМОРОЗКА ЦЕПОЧКИ (2026-10-04): цель умерла/сменилась посреди цепочки -> ненажатые
     # скиллы не выбрасываем, а доигрываем на СЛЕДУЮЩЕЙ цели, как только по ней пошёл урон.
@@ -720,6 +838,7 @@ class FarmBot:
         self.vision = VisionManager()
         self.input_manager = InputManager()
         self.movement = self._make_movement()
+        self._skill_check = self._make_skill_check()
         self.navigator = Navigator()
 
         # ROI считается ОДИН раз в __init__, а не на каждом тике.
@@ -796,6 +915,7 @@ class FarmBot:
         # цепочки реально плавающий кулдаун (сократился баффом), бот об этом
         # не узнает и будет ждать полный интервал.
         self._chains: list[dict] = load_skills_config(_SKILLS_CONFIG_PATH)
+        self._log_chains(self._chains)
 
         # Чёрный ящик и сборщик образцов текста HP (оба пишут на диск в своём потоке).
         self._blackbox = BlackBox(
@@ -831,11 +951,26 @@ class FarmBot:
           3. Цикл спит ровно столько, сколько нужно, чтобы удержать 60 FPS.
         """
         self._running = True
+        # Статистика сессии (2026-10-10): с каждого "Старт" — с нуля, итог печатается на "Стоп".
+        self._session = {"start": time.monotonic(), "kills": 0, "lost": 0, "kill_t": [], "printed": False}
+        # Важные скиллы (8, 9) — не в первые PRIORITY_START_DELAY_S после "Старт" (просьба игрока).
+        # Ротация может собраться позже (в первом бою) — момент запоминаем, _prio применит его сам.
+        self._prio_start_hold_until = time.monotonic() + PRIORITY_START_DELAY_S
+        if getattr(self, "_prio_obj", None) is not None:
+            self._prio_hold_priority()
         logger.info("FarmBot: цикл запущен.")
         if getattr(self, "movement", None) is not None:
             self.movement.start()                 # поток один на всю жизнь бота, повторный start — пустышка
+        sc = getattr(self, "_skill_check", None)
+        if sc is not None:
+            sc._w.start()                         # поток панели скиллов: найти панель и снимать слоты
         if getattr(self, "navigator", None) is not None:
             self.navigator.set_anchor()           # прогулка — вокруг места, где бота запустили (потом — где убил)
+            self.navigator.set_home()             # дом — тоже здесь; сюда бот вернётся примерно раз в 3 минуты
+            self._next_home_at = time.monotonic() + random.uniform(*self._HOME_EVERY_S)
+            self._home_trip_deadline = None
+        self._vision_check_start()
+        self._pull_start()
         try:
             self._run_loop()
         finally:
@@ -845,8 +980,43 @@ class FarmBot:
                 if hasattr(self.movement, "cancel_turn"):
                     self.movement.cancel_turn()
 
+    def _game_focus_ok(self) -> bool:
+        """
+        Жать клавиши можно, только пока спереди окно игры (2026-10-11, лог друга: запуск кнопкой
+        "Старт" — активным было окно программы, нажатия уходили ему, в игре скиллы "не жались").
+        Окно ушло назад — отпускаем всё зажатое и ждём; вернулось — продолжаем с того же места.
+        Проверить без игры: подставь self._game_focus = GameFocus(fg_pid_fn=..., find_fn=...).
+        """
+        gf = getattr(self, "_game_focus", None)
+        if gf is None:
+            from src.core.game_window import GameFocus
+            gf = self._game_focus = GameFocus()
+        active = gf.active()
+        paused = getattr(self, "_focus_paused", False)
+        if not active and not paused:
+            self._focus_paused = True
+            logger.warning("FarmBot: %s — клавиши не жму, жду игру (кликни в окно игры)", gf.reason)
+            gamepad_debug_logger.debug("FOCUS   %s — пауза ввода", gf.reason)
+            self.input_manager.halt_immediately()        # отпустить зажатое: W/ЛКМ не должны "залипнуть"
+            if getattr(self, "movement", None) is not None:
+                self.movement.set_mode(MODE_OFF)
+                if hasattr(self.movement, "cancel_turn"):
+                    self.movement.cancel_turn()
+        elif active and paused:
+            self._focus_paused = False
+            self.input_manager.reset_abort()
+            logger.info("FarmBot: окно игры снова активно — продолжаю")
+            gamepad_debug_logger.debug("FOCUS   окно игры снова активно — продолжаю")
+        return active
+
     def _run_loop(self) -> None:
         while self._running:
+            if getattr(self, '_paused_by_chat', False):
+                time.sleep(0.1)
+                continue
+            if not self._game_focus_ok():
+                time.sleep(0.1)                          # окно игры не активно: тиков нет, ввода нет
+                continue
             frame_start = time.perf_counter()
             # Новый конфиг из приложения (request_chains_reload) применяем ЗДЕСЬ,
             # в потоке FSM, между тиками: ротация никогда не увидит полузаменённый
@@ -859,7 +1029,11 @@ class FarmBot:
             self._nav_tick()
             handler = self._handlers[self.state]
             handler()
+            self._always_keys_tick()
             self._movement_tick()
+            self._skill_check_tick()
+            self._pitch_tick()
+            self._vision_check_tick()
 
             # Вычисляем ОСТАТОК тика через perf_counter(), а не наивный
             # time.sleep(self._FRAME_TIME). Наивный вариант копит дрейф:
@@ -867,6 +1041,7 @@ class FarmBot:
             # 16.6 мс, реальный FPS со временем плавно проседает ниже 60.
             # Здесь же мы спим ровно "то, что осталось" от бюджета тика.
             elapsed = time.perf_counter() - frame_start
+            self._perf_tick(frame_start, elapsed)
             sleep_time = self._FRAME_TIME - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
@@ -879,13 +1054,110 @@ class FarmBot:
                     -sleep_time * 1000,
                 )
 
+    _PERF_LOG_EVERY_S = 10.0
+
+    def _perf_tick(self, now: float, elapsed: float) -> None:
+        """
+        Раз в 10 с строка PERF в input_debug.log: сколько мс занимает тик (зрение + FSM) и
+        реальный FPS. По ней видно, есть ли смысл в более быстром захвате экрана (DXGI):
+        если тик в среднем > ~12 мс — узкое место в захвате/зрении, а не в паузах ввода.
+        """
+        st = self.__dict__.setdefault("_perf", {"t0": now, "n": 0, "sum": 0.0, "max": 0.0})
+        st["n"] += 1
+        st["sum"] += elapsed
+        st["max"] = max(st["max"], elapsed)
+        span = now - st["t0"]
+        if span < self._PERF_LOG_EVERY_S:
+            return
+        extra = ""
+        take = getattr(type(getattr(self, "vision", None)), "perf_take", None)
+        if callable(take):
+            # Из чего тик: захват экрана (mss) в главном потоке и фоновый поиск полосок. Если
+            # захват > ~8 мс/тик — следующий шаг ускорения DXGI-захват (bettercam), не раньше.
+            p = take(self.vision)
+            extra = " | захват экрана %.1f мс/тик" % (p["cap_s"] / st["n"] * 1000)
+            if p["world_n"]:
+                extra += " | полоски в фоне: %.0f/с по %.0f мс" % (p["world_n"] / span,
+                                                                   p["world_s"] / p["world_n"] * 1000)
+            if "dxgi_n" in p:
+                extra += (" | DXGI %.0f кадров/с по %.1f мс" % (p["dxgi_n"] / span, p["dxgi_s"] / max(1, p["dxgi_n"]) * 1000)
+                          if p.get("dxgi_off") is None else " | DXGI выкл: %s" % p["dxgi_off"])
+        gamepad_debug_logger.debug("PERF    тик: средний %.1f мс, максимум %.1f мс, %.0f тиков/с (цель %d)%s",
+                                   st["sum"] / st["n"] * 1000, st["max"] * 1000, st["n"] / span,
+                                   self._TARGET_FPS, extra)
+        self._perf = {"t0": now, "n": 0, "sum": 0.0, "max": 0.0}
+
     def stop(self) -> None:
         """Останавливает цикл run() после текущего тика."""
         self._running = False
+        self._print_session_summary()
+        sc = getattr(self, "_skill_check", None)
+        if sc is not None:
+            sc._w.stop()
         if getattr(self, "movement", None) is not None:
             self.movement.set_mode(MODE_OFF)      # ноги — сразу, не через тик
             if hasattr(self.movement, "cancel_turn"):
                 self.movement.cancel_turn()       # и жест камеры не доигрываем
+
+    def session_stats(self) -> "dict | None":
+        """
+        Итог сессии числами — для окна "Итог сессии" в интерфейсе (app_launcher шлёт его событием).
+        None — бот ещё не запускался. Время в мс эпохи (как Date.now() в JS): monotonic переводим через
+        "сколько секунд назад" — monotonic не прыгает при переводе часов, а эпоха нужна интерфейсу.
+        """
+        ses = getattr(self, "_session", None)
+        if ses is None:
+            return None
+        now_m, now_e = time.monotonic(), time.time()
+        dur = max(1.0, now_m - ses["start"])
+        t = ses["kill_t"]
+        gaps = [b - a for a, b in zip(t, t[1:])]   # zip со сдвигом — пары соседних убийств без индексов
+        return {
+            "started_at_ms": int((now_e - dur) * 1000),
+            "stopped_at_ms": int(now_e * 1000),
+            "duration_s": int(dur),
+            "kills": int(ses["kills"]),
+            "kills_per_hour": int(round(ses["kills"] * 3600.0 / dur)),
+            "avg_kill_gap_s": round(sum(gaps) / len(gaps), 1) if gaps else None,
+            "lost": int(ses["lost"]),
+        }
+
+    def session_summary(self) -> str:
+        """Итог сессии одной строкой-таблицей (её же печатает stop())."""
+        ses = getattr(self, "_session", None)
+        if ses is None:
+            return "Сессия не запускалась."
+        dur = max(1.0, time.monotonic() - ses["start"])
+        k = ses["kills"]
+        h, rem = divmod(int(dur), 3600)
+        m, sec = divmod(rem, 60)
+        t = ses["kill_t"]
+        gaps = [b - a for a, b in zip(t, t[1:])]
+        avg = ("%.1f с" % (sum(gaps) / len(gaps))) if gaps else "-"
+        pairs = [
+            ("Время работы", "%d:%02d:%02d" % (h, m, sec)),
+            ("Убито мобов", "%d" % k),
+            ("Темп, мобов в час", "%.0f" % (k * 3600.0 / dur)),
+            ("Среднее между убийствами", avg),
+            ("Потеряно целей (не добиты)", "%d" % ses["lost"]),
+        ]
+        if getattr(self, "_pull", None) is not None:
+            pairs += self._pull.summary_pairs()
+        lw = max(len(a) for a, _ in pairs)
+        lines = ["%s  %s" % ((a + ":").ljust(lw + 1), b) for a, b in pairs]
+        w = max(len(x) for x in lines)
+        bar = "+" + "-" * (w + 2) + "+"
+        return "\n".join([bar, "| " + "ИТОГ СЕССИИ".center(w) + " |", bar]
+                         + ["| " + x.ljust(w) + " |" for x in lines] + [bar])
+
+    def _print_session_summary(self) -> None:
+        ses = getattr(self, "_session", None)
+        if ses is None or ses.get("printed"):
+            return
+        ses["printed"] = True                       # Стоп мог прийти дважды (кнопка + End) — печатаем один раз
+        text = self.session_summary()
+        print("\n" + text + "\n", flush=True)        # в терминал — заметно, без префикса логгера
+        gamepad_debug_logger.debug("SESSION\n%s", text)
 
     # ------------------------------------------------------------------
     # Обработчики состояний
@@ -916,13 +1188,93 @@ class FarmBot:
         """
         if not self._USE_WORLD_VISION:
             return self._NO_WORLD_BAR
+        # Ускорение цикла (2026-10-05, лог 17:32: тик 75 мс = 13 шагов/с вместо 60, из них ~70 мс —
+        # этот поиск полосок на зоне 1407x589). Когда цель выбирает СПИСОК, полоски нужны только
+        # камере — ей хватает ~10 замеров в секунду (регулятор камеры между замерами ведёт сам).
+        # Поэтому со списком ищем не чаще раза в _WORLD_VISION_EVERY_S, в остальные тики — прошлый
+        # результат (_world_fresh=False: камера по нему повторно не доводится). Без списка
+        # (выбор по зрению) — как раньше, каждый тик.
+        now = time.monotonic()
+        throttle = self._WORLD_VISION_EVERY_S > 0 and self._list_drives()
+        key = (require_marker, bool(getattr(self, "_vision_switch_pending", False)))
+        if throttle and self._WORLD_ASYNC and getattr(self.vision, "supports_async_world", False) is True:
+            return self._read_world_bar_async(now, key, require_marker)
+        cache = getattr(self, "_world_cache", None)
+        if throttle and cache is not None and cache[0] == key and now - cache[1] < self._WORLD_VISION_EVERY_S:
+            self._world_fresh = False
+            return cache[2]
         if require_marker:
-            return self.vision.get_target_info(self._target_roi, require_marker=True)
-        if getattr(self, "_vision_switch_pending", False):
+            info = self.vision.get_target_info(self._target_roi, require_marker=True)
+        elif key[1]:
             # Бежим к мобу, которого выбрало зрение, а в игре ещё выбрана прежняя
             # цель: её бар (с меткой) не ведём, иначе камера вернулась бы к ней.
-            return self.vision.get_target_info(self._target_roi, avoid_marked=True)
-        return self.vision.get_target_info(self._target_roi)
+            info = self.vision.get_target_info(self._target_roi, avoid_marked=True)
+        else:
+            info = self.vision.get_target_info(self._target_roi)
+        self._world_cache = (key, now, info)
+        self._world_fresh = True
+        return info
+
+    # Со списком целей поиск полосок мобов (самая тяжёлая часть тика) — не чаще (см. _read_world_bar).
+    _WORLD_VISION_EVERY_S = 0.10
+    # ...и не в главном цикле, а в фоновом потоке (VisionManager.WorldWorker; лог 2026-10-05 20:43:
+    # тик 33-40 мс, максимум 402 мс — из них 20-40 мс этот поиск). Выключатель на случай проблем.
+    _WORLD_ASYNC = True
+    _WORLD_STALE_S = 0.6               # фон молчит дольше — меряем полоски сами (камера не должна стоять)
+    # Как часто интерпретатор передаёт GIL между потоками (по умолчанию 5 мс). С фоновым поиском
+    # главный цикл иначе мог бы ждать свой ход до 5 мс; 1 мс — ожидание <= 1 мс, накладные — микросекунды.
+    _GIL_SWITCH_S = 0.001
+
+    def _read_world_bar_async(self, now: float, key, require_marker: bool) -> TargetInfo:
+        """
+        То же, что синхронный поиск полосок, но замер идёт в фоне: здесь только забираем готовый
+        (если есть новый — _world_fresh=True, камера по нему доводит) и заказываем следующий не
+        чаще _WORLD_VISION_EVERY_S. Задержка данных та же, что раньше (кадр снят ~20-40 мс назад:
+        раньше столько же длился сам поиск в тике), зато тик его не ждёт.
+        Новый режим (бой/поиск), под который замера ещё нет, -> "бара нет" до первого замера
+        (~1 тик; камера в бою и так ждёт _LIST_CAM_LOST_S, прежде чем что-то делать).
+        Как проверить без игры: perf_timing_test.py, блок WA.
+        """
+        v = self.vision
+        if not getattr(self, "_gil_tuned", False):
+            self._gil_tuned = True
+            sys.setswitchinterval(self._GIL_SWITCH_S)
+        info = v.world_async_take(key, getattr(self, "_world_valid_from", float("-inf")))
+        self._world_fresh = info is not None
+        if info is not None:
+            self._world_cache = (key, now, info)
+            self._world_fresh_at = now
+        elif now - getattr(self, "_world_fresh_at", now) > self._WORLD_STALE_S:
+            # Фон давно не отдаёт свежий замер (лог 2026-10-09 23:41:10-20: 10 с одна и та же
+            # картинка — камера стояла, моб ушёл за край). Меряем сами, синхронно (~25 мс):
+            # камера без свежих данных хуже, чем один долгий тик.
+            if not getattr(self, "_world_stale_logged", False):
+                self._world_stale_logged = True
+                gamepad_debug_logger.debug("WORLD   фоновый поиск полосок не отдаёт свежий замер %.1f с — меряю сам",
+                                           now - getattr(self, "_world_fresh_at", now))
+            if require_marker:
+                info = v.get_target_info(self._target_roi, require_marker=True)
+            elif key[1]:
+                info = v.get_target_info(self._target_roi, avoid_marked=True)
+            else:
+                info = v.get_target_info(self._target_roi)
+            self._world_cache = (key, now, info)
+            self._world_fresh = True
+            self._world_fresh_at = now
+            return info
+        if info is not None:
+            self._world_stale_logged = False
+        if not hasattr(self, "_world_fresh_at"):
+            self._world_fresh_at = now
+        cache = getattr(self, "_world_cache", None)
+        new_mode = cache is None or cache[0] != key       # бой/поиск сменился — замер под него сразу
+        if (new_mode or now - getattr(self, "_world_req_at", float("-inf")) >= self._WORLD_VISION_EVERY_S) \
+                and not v.world_async_busy():
+            kw = {"require_marker": True} if require_marker else ({"avoid_marked": True} if key[1] else {})
+            v.world_async_request(self._target_roi, kw, key)
+            self._world_req_at = now
+        cache = getattr(self, "_world_cache", None)
+        return cache[2] if cache is not None and cache[0] == key else self._NO_WORLD_BAR
 
     def _scan_tab_delay(self) -> float:
         """Пауза до следующего пробного Tab в фазе SCAN."""
@@ -952,6 +1304,11 @@ class FarmBot:
         aim_info = self._read_world_bar()
         now = time.monotonic()
         self._log_vision_status(panel_info, aim_info, now)
+        pl = getattr(self, "_pull", None)
+        if pl is not None and pl.phase == PULL_RETURN:
+            self._pull_return_tick(now)          # бег домой: ни скиллов, ни входа в бой по панели
+            return
+        self._tick_own_cd_idle(now, panel_info)
         self._note_tab_result(now, panel_info.found, panel_info.hp_percent)
         self._bb_observe(now, panel_info)
         # Колесо только в осмотре (никого не видно — отдаление помогает найти).
@@ -986,7 +1343,11 @@ class FarmBot:
                 return
             self._vision_switch_pending = False   # подход сорвался — обычный поиск
 
-        if panel_info.found:
+        if panel_info.found and self._pull_panel_stranger(panel_info):
+            # Пул (2026-10-14): игра сама выделила свежего моба (HP 100%, без мечей) — это не наш
+            # паровоз, в бой по панели не входим. Цели пула берём только из таблицы (фаза LIST).
+            self._panel_seen_since = None
+        elif panel_info.found:
             if (
                 self._search_phase is SearchPhase.REACQUIRE
                 and not self._reacquire_hp_matches(panel_info.hp_percent)
@@ -1012,6 +1373,9 @@ class FarmBot:
             self._search_reacquire(now, panel_info)
             return
 
+        if self._search_phase in (SearchPhase.APPROACH, SearchPhase.SCAN) and self._list_preempts_vision(now):
+            return
+
         if self._search_phase is SearchPhase.APPROACH:
             self._search_approach(now, aim_info)
             return
@@ -1023,11 +1387,34 @@ class FarmBot:
         if self._search_phase is SearchPhase.ROAM:
             self._search_roam(now)
             return
+        if self._pull_search_tick(now):
+            return
+        if self._home_due(now):
+            self._start_home_trip(now)
+            return
         # Список целей — первым: игра сама знает, кто рядом и насколько далеко.
         if self._try_list_target(now, "поиск"):
             self._list_empty_since = None
             return
         if self._list_drives():
+            tl_now = getattr(self, "_list_last", None)
+            if (tl_now is not None and getattr(tl_now, "visible", False)
+                    and tl_now.nearest(self._list_exclude(now)) is not None):
+                # Цель в таблице ЕСТЬ, просто ввод занят (каст "6", R, выбор): это не "некого" — ждём
+                # ввод, без R и без отсчёта до прогулки (лог 07:51:44: бот ушёл гулять от 5 мобов в 25 м).
+                self._list_empty_since = None
+                return
+            if (self._EAGLE_ENABLED and getattr(self, "_pull", None) is None
+                    and now >= getattr(self, "_eagle_next_at", 0.0)):
+                # Кликнуть некого — сначала орлиное зрение (R): автообновление таблицы в игре
+                # выключено (2026-10-13), без R новые мобы в таблице не появятся. Не чаще раза в
+                # 1.5-2.5 с; прогулка (через 2 с пустоты) идёт как раньше.
+                im = self.input_manager
+                (getattr(im, "execute_combo_now", None) or im.execute_combo)(["press_" + self._EAGLE_KEY])
+                self._eagle_next_at = now + random.uniform(*self._EAGLE_IDLE_EVERY_S)
+                self._list_next_read_at = now + self._EAGLE_WAIT_S
+                gamepad_debug_logger.debug("LIST    кликнуть некого — орлиное зрение (%s)", self._EAGLE_KEY.upper())
+                return
             since = getattr(self, "_list_empty_since", None)
             if since is None:
                 self._list_empty_since = since = now
@@ -1045,6 +1432,14 @@ class FarmBot:
                 gamepad_debug_logger.debug("LIST    кликнуть некого (пусто/чёрный список) — камеру не кручу, жду")
             return
         self._list_idle_logged = False
+        if (self._LIST_TARGETING and not getattr(self, "_list_ever_seen", False)
+                and getattr(self.vision, "list_search_pending", False) is True):
+            # Старт: панель списка могла уехать с места из конфига — зрение ищет её (доли
+            # секунды). Раньше бот сразу уходил в поиск зрением и ~10 с бегал к мобам "на
+            # глаз" (лог 18:24:52). Ждём список до _LIST_STARTUP_WAIT_S, потом — зрение.
+            since = self.__dict__.setdefault("_list_wait_from", now)
+            if now - since < self._LIST_STARTUP_WAIT_S:
+                return
         if self._LIST_TARGETING and getattr(self, "_list_ever_seen", False):
             # Список целей был, а теперь не виден (закрыт / другая вкладка). Раньше бот
             # переходил на старый поиск зрением и бежал к случайному мобу в кадре
@@ -1232,6 +1627,7 @@ class FarmBot:
         сигнатурой cancel_pending_actions(self) продолжает работать.
         """
         self._freeze_inflight_chain(now)
+        self._restore_unpressed_weaves(now)
         if cut_wait:
             self.input_manager.cancel_pending_actions(cut_current_wait=True)
             if self._chain_inflight is not None:
@@ -1278,7 +1674,8 @@ class FarmBot:
             return False
         gamepad_debug_logger.debug("CHAIN   RESUME '%s': доигрываю %d скилл(ов), не нажатых до смерти цели",
                                    fr["name"], len(left))
-        self._start_chain_steps(now, fr["name"] + " (доигрываю)", left)
+        base = fr["name"].replace(" (доигрываю)", "")      # без "(доигрываю) (доигрываю) ..." в логе
+        self._start_chain_steps(now, base + " (доигрываю)", left)
         return True
 
     def _input_tracks_chains(self) -> bool:
@@ -1349,6 +1746,22 @@ class FarmBot:
         gamepad_debug_logger.debug(
             "CONFIG  цепочки обновлены на лету, порядок: %s", [c["name"] for c in chains]
         )
+        self._log_chains(chains)
+
+    @staticmethod
+    def _log_chains(chains: "list[dict]") -> None:
+        """
+        Строки CHAINS в input_debug.log: какие цепочки бот реально загрузил, в каком порядке,
+        с какими клавишами и откуда пуск. По ним сразу видно, что сохранило приложение
+        (2026-10-05: в файле была одна цепочка вместо двух — бот тут ни при чём).
+        """
+        if not chains:
+            gamepad_debug_logger.debug("CHAINS  цепочек нет — бот бьёт только автоатакой")
+            return
+        for i, c in enumerate(chains, 1):
+            gamepad_debug_logger.debug("CHAINS  %d) '%s': %s, перезарядка %.0f-%.0f с, пуск: %s",
+                                       i, c["name"], " ".join(c.get("sequence", [])), c["cooldown_min"],
+                                       c["cooldown_max"], c.get("trigger_note", "со старта"))
 
     def _chain_busy(self, now: float) -> bool:
         """
@@ -1595,18 +2008,48 @@ class FarmBot:
                 mv.cancel_turn()                   # цель нашлась — поворот "куда бегу"/осмотр больше не нужен
                 self._cam_turn_req = False
             self._camera_reset_look()
-            self._camera_comfort(now, target.offset_x)
+            self._cam_last_dx = (target.offset_x, now)     # где цель была — куда довернуть, если уйдёт из кадра
+            self._camera_comfort(now, target.offset_x, target.offset_y)
             return
         if now - getattr(self, "_list_cam_seen_at", float("-inf")) < self._LIST_CAM_LOST_S:
             return
         self._cam_correcting = False
-        if self.state is State.COMBAT and (getattr(self, "_engaged", False) or getattr(self, "_lp_in_melee", False)):
-            # Ближний бой, полоски цели в кадре нет (моб вплотную, полоска над краем): крутить
-            # камеру по кругу — не по-человечески и сбивает обзор. Стоим, ждём, пока покажется.
+        if self.state is State.COMBAT and (getattr(self, "_engaged", False) or getattr(self, "_lp_in_melee", False)) \
+                and self._camera_follow_lost(now):
+            return
+        if self.state is State.COMBAT and (getattr(self, "_engaged", False) or getattr(self, "_lp_in_melee", False)) \
+                and now - getattr(self, "_list_cam_seen_at", float("-inf")) < self._CAM_MELEE_WAIT_S:
+            # Ближний бой, полоски цели в кадре нет (моб вплотную, полоска над краем): сразу крутить
+            # камеру не по-человечески. Ждём _CAM_MELEE_WAIT_S, пока покажется.
             if getattr(self, "_list_cam_scanning", False):
                 self.input_manager.stop_sweep()
                 self._list_cam_scanning = False
                 gamepad_debug_logger.debug("CAMERA  ближний бой, цели в кадре нет — разворот остановлен")
+            return
+        if self.state is State.COMBAT and (getattr(self, "_engaged", False) or getattr(self, "_lp_in_melee", False)):
+            # Бой идёт, а нашей цели в кадре нет уже _CAM_MELEE_WAIT_S (лог 2026-10-09: бот бил моба
+            # за кадром, камера стояла): плавный разворот В СТОРОНУ, где цель видели последней, пока
+            # не найдём. Нашли — _list_camera остановит разворот и поведёт камеру к ней.
+            if getattr(self, "_list_cam_scanning", False):
+                if now - getattr(self, "_cam_melee_sweep_at", now) > self._CAM_MELEE_SWEEP_MAX_S:
+                    self.input_manager.stop_sweep()   # полный круг без толку — не крутим бесконечно
+                    gamepad_debug_logger.debug("CAMERA  цель так и не показалась — разворот остановлен")
+                    self._list_cam_seen_at = now      # подождём ещё и попробуем снова
+                    self._list_cam_scanning = False
+                return
+            if not getattr(self, "_list_cam_scanning", False):
+                self._cam_melee_sweep_at = now
+                last = getattr(self, "_cam_last_dx", None)
+                side = 0 if last is None else (-1 if last[0] < 0 else 1)
+                self.input_manager.clear_aim_target()
+                try:
+                    self.input_manager.start_sweep(side)
+                except TypeError:
+                    self.input_manager.start_sweep()
+                self._list_cam_scanning = True
+                gamepad_debug_logger.debug("CAMERA  бой, цели в кадре нет %.1f с — разворачиваюсь %s, ищу её",
+                                           min(99.0, now - getattr(self, "_list_cam_seen_at", now)),
+                                           {-1: "влево", 1: "вправо"}.get(side, "в случайную сторону"))
             return
         if self.state is State.COMBAT and self._camera_face_run(now):
             return
@@ -1720,24 +2163,62 @@ class FarmBot:
         self._cam_look_wait_from = None
         self._cam_look_done_logged = False
 
-    def _camera_comfort(self, now: float, dx: float) -> None:
+    # Цель ушла из кадра в бою (жалоба 2026-10-05 "камера не держит цель"): если в последний раз
+    # её видели у края (дальше этой доли ширины от прицела) не дольше _CAM_FOLLOW_MEMORY_S назад —
+    # доворачиваем туда, где она была (моб обежал персонажа). У центра пропала — это моб вплотную
+    # (полоска над краем экрана), крутить не надо.
+    _CAM_FOLLOW_EDGE_FRAC = 0.12
+    _CAM_FOLLOW_MEMORY_S = 2.5
+
+    def _camera_follow_lost(self, now: float) -> bool:
+        """Довернуть камеру к стороне, где цель пропала (см. _CAM_FOLLOW_*). True — занялись."""
+        last = getattr(self, "_cam_last_dx", None)
+        if last is None or now - last[1] > self._CAM_FOLLOW_MEMORY_S:
+            return False
+        w = float(getattr(self.vision, "screen_w", 1920) or 1920)
+        dx = last[0]
+        if abs(dx) < self._CAM_FOLLOW_EDGE_FRAC * w:
+            return False
+        if getattr(self, "_cam_follow_at", None) != last[1]:
+            # Один замер "цель там, где видели последний раз" — тот же плавный регулятор, что и
+            # при видимой цели, доведёт камеру на это расстояние и сам остановится (повторять
+            # тот же замер каждый тик нельзя: регулятор крутил бы без конца).
+            self._cam_follow_at = last[1]
+            gamepad_debug_logger.debug("CAMERA  цель ушла из кадра %s — доворачиваю туда", "влево" if dx < 0 else "вправо")
+            self.input_manager.aim_with_stick(dx * 1.3, 0.0, adaptive=True, gentle=False)
+        return True
+
+    # Доводка и по вертикали (2026-10-06, жалоба "прицел часто не на мобе, нет вверх/вниз"): раньше
+    # dy=0 — вертикаль укладывала камеру в пол. Теперь пол стережёт коридор наклона
+    # (src/core/camera_pitch.py), и вертикаль можно вести. False — как раньше, только горизонталь.
+    _CAM_COMFORT_VERTICAL = True
+
+    def _camera_comfort(self, now: float, dx: float, dy: float = 0.0) -> None:
         """
-        Цель в кадре: держим её в удобной зоне у центра, как человек. Только по горизонтали
-        (dy=0): наклон не трогаем — ведение по вертикали укладывало камеру в пол (скрин 09:49).
+        Цель в кадре: держим её в удобной зоне у центра, как человек. С 2026-10-06 — по обеим
+        осям (зона — круг, а не полоса): ниже рабочего коридора камеру не пустит PitchGuard.
         Гистерезис (выйти за 10% ширины / вернуться в 3%) — чтобы не дёргать камеру на
         каждом пикселе; задержка реакции — человек замечает, что цель уехала, не мгновенно.
         """
-        if self._gestures_ok():
+        if not getattr(self, "_world_fresh", True):
+            return                                # кадр не новый (поиск полосок пропущен) — регулятор ведёт сам
+        if self._CAM_AIM_GESTURES and self._gestures_ok():
             self._camera_gesture_aim(now, dx)
             return
+        mv = getattr(self, "movement", None)
+        if mv is not None and getattr(mv, "turn_active", False) and hasattr(mv, "cancel_turn"):
+            mv.cancel_turn()                      # жест осмотра/"куда бегу" не спорит с доводкой
         w = float(getattr(self.vision, "screen_w", 1920) or 1920)
+        if not self._CAM_COMFORT_VERTICAL:
+            dy = 0.0
+        err = math.hypot(dx, dy)                  # расстояние до прицела по обеим осям
         if getattr(self, "_cam_correcting", False):
-            if abs(dx) <= self._CAM_ZONE_IN * w:
+            if err <= self._CAM_ZONE_IN * w:
                 self._cam_correcting = False
                 self.input_manager.clear_aim_target()
                 return
         else:
-            if abs(dx) <= self._CAM_ZONE_OUT * w:
+            if err <= self._CAM_ZONE_OUT * w:
                 self._cam_out_since = None
                 return
             since = getattr(self, "_cam_out_since", None)
@@ -1748,8 +2229,9 @@ class FarmBot:
                 return
             self._cam_correcting = True
             self._cam_out_since = None
-        # adaptive — поправка на то, что близкий моб едет по экрану медленнее.
-        self.input_manager.aim_with_stick(dx, 0.0, adaptive=True, gentle=True)
+        # adaptive — поправка на то, что близкий моб едет по экрану медленнее. Не gentle:
+        # мягкая (вдвое медленнее) доводка не успевала за целью на бегу — прицел отставал.
+        self.input_manager.aim_with_stick(dx, dy, adaptive=True, gentle=False)
 
     def _camera_face_run(self, now: float) -> bool:
         """
@@ -1866,9 +2348,13 @@ class FarmBot:
         d = sel.distance_m if sel is not None else None
         if d is None:
             return
+        if self._lp_check_closer(now, tl, sel):
+            return
         nav = getattr(self, "navigator", None)
-        if nav is not None:
-            nav.observe_target_distance(d)        # бежим к мобу сами: метры списка vs сдвиг карты = масштаб
+        if nav is not None and getattr(self, "_pull", None) is None:
+            # Бежим к мобу сами: метры списка vs сдвиг карты = масштаб. В режиме пул НЕ меряем: мобы
+            # бегут на нас (сагрены), сближение быстрее нашего бега — замер врёт вдвое (см. navigation).
+            nav.observe_target_distance(d)
         if d <= self._LP_MELEE_M:
             # Добежали: на первый удар даём 5 с, дальше обычный сторож (_engage_timeout).
             self._eg_deadline = min(self._eg_deadline, now + 5.0) if not getattr(self, "_lp_in_melee", False) else self._eg_deadline
@@ -1905,6 +2391,46 @@ class FarmBot:
                                    sel.index)
         return self._try_list_switch(now, why="цель посерела")
 
+    def _closer_row(self, tl, cur, now: float):
+        """
+        Строка списка ЗАМЕТНО ближе текущей цели (см. _CLOSER_*) или None. Без чтения экрана —
+        по уже разобранному списку. Серые и строки из чёрного списка не берём (nearest их
+        отсекает); строки без прочитанных метров не сравниваем — "?" не повод бросать цель.
+        """
+        if not self._CLOSER_ENABLED or tl is None or not tl.visible or cur is None or cur.distance_m is None:
+            return None
+        cand = tl.nearest(self._list_exclude(now) | {cur.index})
+        if cand is None or cand.distance_m is None:
+            return None
+        d0, d1 = cur.distance_m, cand.distance_m
+        if d1 <= d0 - self._CLOSER_MIN_GAIN_M and d1 <= d0 * self._CLOSER_MAX_RATIO:
+            return cand
+        return None
+
+    def _lp_check_closer(self, now: float, tl, sel) -> bool:
+        """
+        До первого удара: в списке есть цель заметно ближе выбранной _CLOSER_CONFIRM_S подряд ->
+        переключаемся на неё (F-бинд + E, как обычный выбор). True — ушли менять цель.
+        Подтверждение по НОМЕРУ кандидата: если ближний сменился (другой номер) — отсчёт заново.
+        """
+        cand = self._closer_row(tl, sel, now)
+        if cand is None:
+            self._closer_seen = None
+            return False
+        seen = getattr(self, "_closer_seen", None)
+        if seen is None or seen[0] != cand.index:
+            self._closer_seen = (cand.index, now)
+            return False
+        if (now - seen[1] < self._CLOSER_CONFIRM_S or now < getattr(self, "_closer_next_at", 0.0)
+                or not self.input_manager.is_idle()):
+            return False
+        self._closer_seen = None
+        self._closer_next_at = now + self._CLOSER_COOLDOWN_S
+        gamepad_debug_logger.debug("CLOSER  №%d в %d м заметно ближе цели №%d (%d м), урона ещё нет — беру ближнюю",
+                                   cand.index, cand.distance_m, sel.index, sel.distance_m)
+        # Далёкую НЕ в чёрный список: она не виновата, просто дальше — потом возьмём и её.
+        return self._try_list_switch(now, why="ближе другая цель", blacklist=False)
+
     def _list_target_number(self) -> "int | None":
         """Номер нашей цели: выбранная строка списка, а до того — строка, по которой кликнули."""
         tl = getattr(self, "_list_last", None)
@@ -1940,7 +2466,7 @@ class FarmBot:
         tl = getattr(self, "_list_last", None)
         return tl is not None and tl.visible
 
-    def _refresh_list(self, now: float):
+    def _refresh_list(self, now: float, force: bool = False):
         """
         Свежий разбор списка не чаще _LIST_READ_EVERY_S (иначе — прошлый). None —
         список выключен или у зрения нет метода (моки старых тестов). Смена списка
@@ -1951,21 +2477,76 @@ class FarmBot:
         fn = getattr(self.vision, "get_target_list", None)
         if fn is None:
             return None
-        if now >= getattr(self, "_list_next_read_at", 0.0):
+        # force: прочитать сейчас, даже если читали < _LIST_READ_EVERY_S назад — перед нажатием
+        # F номер строки должен быть из самого свежего кадра (список перенумеровывается).
+        if force or now >= getattr(self, "_list_next_read_at", 0.0):
             self._list_next_read_at = now + self._LIST_READ_EVERY_S
-            tl = fn()
+            self._list_reads = getattr(self, "_list_reads", 0) + 1     # для проверки зрения на старте
+            raw = fn()
+            tl = self._stabilize_list(raw)
             self._list_last = tl
+            self._list_raw_last = raw
             if tl.visible:
                 self._list_ever_seen = True
                 if getattr(self, "_list_gone_logged", False):
                     self._list_gone_logged = False
                     gamepad_debug_logger.debug("LIST    список целей снова виден")
             text = format_list(tl)
+            raw_text = format_list(raw)
+            if raw_text != text:
+                text += "   (сырое чтение: %s)" % raw_text
             if text != getattr(self, "_list_last_text", None):
                 self._list_last_text = text
                 gamepad_debug_logger.debug("LIST    %s", text)
             self._save_list_glyphs(tl)
         return getattr(self, "_list_last", None)
+
+    # Метры одной строки между двумя чтениями (~0.15 с) не прыгают больше чем на столько:
+    # моб бежит ~6-8 м/с. Скачок = одно из чтений кривое (анимация списка, хвост имени).
+    _LIST_JUMP_M = 6
+
+    def _stabilize_list(self, tl):
+        """
+        Защита выбора цели от одного кривого кадра списка (лог 2026-10-05 16:09:41: строка №1
+        в 18-19 м читалась как "619 м, серая" -> бот взял №4 в 25 м). По каждому номеру строки
+        помним последние принятые метры:
+          - новое чтение близко к ним (<= _LIST_JUMP_M) -> принимаем;
+          - скачок -> пока "не знаю" (None: nearest() ставит такую строку в конец); если и
+            следующее чтение даёт то же новое значение — значит, правда (игра перенумеровала
+            строки или моб рывком ушёл) -> принимаем;
+          - "серая" — только если серая и в прошлом чтении тоже (одиночный серый кадр не в счёт).
+        Без экрана, микросекунды.
+        """
+        prev = getattr(self, "_list_raw_prev", None)
+        self._list_raw_prev = tl
+        if not getattr(tl, "visible", False) or not getattr(tl, "rows", ()):
+            self._list_dist_mem = {}
+            return tl
+        mem = self.__dict__.setdefault("_list_dist_mem", {})   # номер -> [принятые метры, кандидат]
+        prev_rows = {r.index: r for r in prev.rows} if prev is not None and getattr(prev, "visible", False) else {}
+        rows, changed = [], False
+        for r in tl.rows:
+            d = r.distance_m
+            if d is not None:
+                acc, cand = mem.get(r.index, (None, None))
+                if acc is None or abs(d - acc) <= self._LIST_JUMP_M:
+                    mem[r.index] = (d, None)
+                elif cand is not None and abs(d - cand) <= self._LIST_JUMP_M:
+                    mem[r.index] = (d, None)             # второе чтение подряд подтвердило скачок
+                else:
+                    mem[r.index] = (acc, d)
+                    d = None                             # пока не знаем, какое из чтений кривое
+            p = prev_rows.get(r.index)
+            # Серая только что, а в прошлом чтении была цветной — ждём подтверждения. Прошлого
+            # чтения этой строки нет (первый кадр) — верим как есть: проверить не с чем.
+            faded = bool(r.faded and (p is None or p.faded))
+            if d != r.distance_m or faded != r.faded:
+                r = dataclasses.replace(r, distance_m=d, faded=faded)
+                changed = True
+            rows.append(r)
+        if not changed:
+            return tl
+        return TargetList(tl.visible, tuple(rows), tl.reason, tl.unsure_glyphs)
 
     def _save_list_glyphs(self, tl) -> None:
         """Цифры, узнанные неуверенно (0 и 5 пока без образцов) — на диск, в фоне."""
@@ -1980,7 +2561,12 @@ class FarmBot:
             if key in seen or len(seen) >= self._LIST_SAMPLES_MAX:
                 continue
             seen.add(key)
-            path = os.path.join(_PROJECT_ROOT, "list_digit_samples", "%s_%08x.png" % (guess, key & 0xFFFFFFFF))
+            # Панель не 100% (игрок уменьшил) — в имя файла масштаб: по таким кадрам снимаются
+            # образцы цифр именно этого размера (s9375_5_xxxx.png -> d5_s9375_N в list_digits.npz).
+            sc = getattr(self.vision, "list_scale", 1.0)
+            sc = float(sc) if isinstance(sc, (int, float)) else 1.0    # моки зрения с __getattr__ — не число
+            tag = "" if abs(sc - 1.0) < 0.015 else "s%04d_" % round(sc * 10000)
+            path = os.path.join(_PROJECT_ROOT, "list_digit_samples", "%s%s_%08x.png" % (tag, guess, key & 0xFFFFFFFF))
             writer.submit(_imwrite, path, win.astype("uint8"))
 
     def _list_has_target(self, now: float) -> bool:
@@ -1990,22 +2576,131 @@ class FarmBot:
 
     def _list_exclude(self, now: float) -> "set[int]":
         bl = self.__dict__.setdefault("_list_blacklist", {})
-        return {i for i, until in bl.items() if until > now}
+        out = {i for i, until in bl.items() if until > now}
+        pl = getattr(self, "_pull", None)
+        if pl is not None:
+            # Режим пул: кого в этой фазе брать нельзя (src/core/pull.py, PullPlanner.excluded). Через
+            # общий "чёрный список" — тогда ВСЕ места выбора цели (после убийства, смена, повтор F)
+            # видят одно правило, а не каждое своё.
+            tl = getattr(self, "_list_last", None)
+            if tl is not None and getattr(tl, "visible", False):
+                pl.track(tl.rows, now)
+                if pl.phase == PULL_GATHER:
+                    n_before = len(pl.followers)
+                    pl.note_followers(tl.rows, now)
+                    if len(pl.followers) > n_before:
+                        gamepad_debug_logger.debug("PULL    за мной бежит %s — в паровозе (%d из %d)", ", ".join(
+                            "№%d" % i for i in sorted(pl.followers)), pl.train(tl.rows), pl.t.max_tags)
+                    if not pl.topup and not self._pull_plan_ready(now, tl):
+                        # Снимка после R ещё нет — на сборе не берём НИКОГО, каким бы путём ни выбирали
+                        # (после убийства, после тычки, повтор F): лог 00:24 — снимок обходили, 5 мобов.
+                        return out | {r.index for r in tl.rows}
+                out |= pl.excluded(tl.rows, self.navigator.dist_home_m())
+        return out
 
-    def _try_list_target(self, now: float, why: str, exclude_extra: "set[int] | None" = None) -> bool:
+    # Следующая цель сразу после убийства (без фазы выбора), см. вердикт в _handle_combat.
+    _PREPICK_ENABLED = True
+    # Старт без найденного списка: столько ждём, пока зрение найдёт панель, прежде чем
+    # искать мобов "на глаз".
+    _LIST_STARTUP_WAIT_S = 3.0
+
+    def _list_preempts_vision(self, now: float) -> bool:
         """
-        Ближний моб из списка -> фаза LIST (клик после короткой "реакции"). True — пошли
-        кликать; False — списка нет/пусто/все в чёрном списке, вызывающий ищет как раньше.
+        Идёт поиск зрением (подход/осмотр), а список целей тем временем нашёлся и в нём есть
+        кого выбрать -> зрение бросаем, цель берём из списка. True — ушли в выбор по списку.
         """
-        if now < self._next_action_at or not self.input_manager.is_idle():
+        if not self._LIST_TARGETING:
             return False
         tl = self._refresh_list(now)
         if tl is None or not tl.visible or not tl.rows:
             return False
+        self.input_manager.stop_scan()
+        self.input_manager.stop_sweep()
+        self.input_manager.clear_aim_target()
+        self._next_action_at = min(self._next_action_at, now)
+        if self._try_list_target(now, "список нашёлся — зрение бросаю", immediate=True):
+            return True
+        return False
+
+    # Строки одного и того же моба в двух чтениях списка: метры отличаются не больше (моб и мы
+    # бежим, список читается раз в ~0.1 с).
+    _LIST_SAME_MOB_M = 3
+    # F+E не дали ни рамки на новой строке, ни панели за столько — список, скорее всего,
+    # перенумеровался между чтением и нажатием: один раз жмём ещё раз по свежему чтению
+    # (рамка/панель обычно появляются за 0.13-0.2 с).
+    _LIST_REPRESS_S = 0.5
+
+    def _list_pick(self, tl, exclude: "set[int]", prefer_dist: "int | None" = None):
+        """
+        Какую строку жать: prefer_dist (цель потеряна, не убита) — строку с метрами ближе всего
+        к ним (+-_LIST_SAME_MOB_M: это она же), иначе — ближнюю (TargetList.nearest).
+        """
+        pl = getattr(self, "_pull", None)
+        if pl is not None and pl.phase == PULL_KILL:
+            # Пул, добивание у дома (2026-10-13, просьба игрока): просто БЛИЖАЙШАЯ из разрешённых —
+            # привезённые ближники стоят кучей вокруг нас, по ним и бьют скиллы по площади. Раненые/
+            # нападающие и так в фильтре зоны (_list_exclude), отдельный приоритет им тут не нужен.
+            near = [r for r in tl.rows if r.index not in exclude and not r.selected and not r.faded
+                    and r.distance_m is not None]
+            if near:
+                return min(near, key=lambda r: r.distance_m)
+        fight = tl.fighting(exclude)
+        if fight is not None:
+            # Моб вплотную с неполным HP бьёт нас — его первым, даже если ищем "ту же по метрам"
+            # (blackbox 060426_017: "та же" в 11 м оказалась другим мобом, а этот на 0 м остался).
+            return fight
+        if prefer_dist is not None:
+            same = [r for r in tl.rows if r.index not in exclude and r.distance_m is not None
+                    and not r.faded and abs(r.distance_m - prefer_dist) <= self._LIST_SAME_MOB_M]
+            if same:
+                return min(same, key=lambda r: abs(r.distance_m - prefer_dist))
+        return tl.nearest(exclude)
+
+    def _list_repick(self, now: float, why: str) -> None:
+        """
+        Перед нажатием F — свежее чтение списка (1-3 мс) и снова ближняя: между выбором и
+        нажатием игра могла перенумеровать строки (моб умер/появился/список пересортирован),
+        и F с прежним номером взял бы другого моба или пустую строку.
+        """
+        tl = self._refresh_list(now, force=True)
+        if tl is None or not tl.visible or not tl.rows:
+            return
+        row = tl.nearest(self._list_exclude(now))
+        old = self._list_row
+        if row is None or (row.index == old.index and (row.distance_m is None or old.distance_m is None
+                                                        or abs(row.distance_m - old.distance_m) <= self._LIST_SAME_MOB_M)):
+            return
+        jx, jy = self._LIST_JITTER_PX
+        px, py = row.click_point
+        self._list_target_xy = self.vision.list_point_to_screen(
+            (px + random.uniform(-jx, jx), py + random.uniform(-jy, jy)))
+        self._list_row = row
+        gamepad_debug_logger.debug("LIST    %s: список обновился — №%d (%s) -> №%d (%s) [%s]", why,
+                                   old.index, "?" if old.distance_m is None else "%d м" % old.distance_m,
+                                   row.index, "?" if row.distance_m is None else "%d м" % row.distance_m,
+                                   format_list(tl))
+
+    def _try_list_target(self, now: float, why: str, exclude_extra: "set[int] | None" = None,
+                         immediate: bool = False, prefer_dist: "int | None" = None) -> bool:
+        """
+        Ближний моб из списка -> фаза LIST (клик после короткой "реакции"). True — пошли
+        кликать; False — списка нет/пусто/все в чёрном списке, вызывающий ищет как раньше.
+        immediate=True — F+E ставятся в очередь ввода прямо сейчас (без реакции, без ожидания
+        пустой очереди: выбор встанет сразу за текущим нажатием, если оно идёт).
+        """
+        if not immediate and (now < self._next_action_at or not self.input_manager.is_idle()):
+            return False
+        tl = self._refresh_list(now, force=immediate)
+        if tl is None or not tl.visible or not tl.rows:
+            return False
         exclude = self._list_exclude(now) | (exclude_extra or set())
-        row = tl.nearest(exclude)
+        row = self._list_pick(tl, exclude, prefer_dist)
         if row is None:
             return False
+        if prefer_dist is not None and row.distance_m is not None \
+                and abs(row.distance_m - prefer_dist) <= self._LIST_SAME_MOB_M:
+            why = "цель сбросилась, моб ещё в списке — беру его же"
+        self._list_repressed = False
         jx, jy = self._LIST_JITTER_PX
         px, py = row.click_point
         self._list_target_xy = self.vision.list_point_to_screen(
@@ -2024,8 +2719,42 @@ class FarmBot:
         self.input_manager.clear_aim_target()
         self._set_phase(SearchPhase.LIST, now, "%s: ближний в списке №%d (%s)" % (
             why, row.index, "?" if row.distance_m is None else "%d м" % row.distance_m))
-        gamepad_debug_logger.debug("LIST    -> №%d из [%s], клик Alt+ПКМ", row.index, format_list(tl))
+        gamepad_debug_logger.debug("LIST    -> №%d из [%s]%s", row.index, format_list(tl),
+                                   " — сразу" if immediate else "")
+        # Кадр списка в чёрный ящик (первые 15 выборов за запуск): по нему видно, правильно ли
+        # прочитаны метры и серость, если бот взял "не ту" цель.
+        raw = getattr(self, "_list_raw_last", None)
+        self._bb_event(now, "list_pick", {"picked": row.index, "list": format_list(tl),
+                                          "raw": format_list(raw) if raw is not None else None},
+                       images={"list.png": getattr(self.vision, "last_list_frame", None)})
+        if immediate:
+            self._list_do_click(now, panel_before=False)
         return True
+
+    def _list_do_click(self, now: float, panel_before: bool) -> None:
+        """Выбрать строку _list_row (F+E / клик) и начать ждать подтверждения (см. _search_list_wait)."""
+        pressed = self._clicks_pressed()
+        self._list_click_press_target = None if pressed is None else pressed + 1
+        # Какая строка была выбрана ДО нажатия (смена цели из боя): новая рамка — не она.
+        tl0 = getattr(self, "_list_last", None)
+        ps = tl0.selected_row if tl0 is not None and getattr(tl0, "visible", False) else None
+        self._list_prev_sel = (ps.index, ps.distance_m) if ps is not None else None
+        self._list_click_at = now
+        self._combat_last_dist = self._list_row.distance_m   # метры НОВОЙ цели (см. вердикт в _handle_combat)
+        self._list_select(self._list_row, self._list_target_xy)
+        self._list_clicked = True
+        vc = getattr(self, "_vcheck", None)
+        if vc is not None:
+            self._vision_check_report([("fail", k) for k in vc.on_list_click()])
+        self._list_cam_scanning = False
+        self._list_cam_how = None
+        # Камеру не крутим первые _LIST_CAM_LOST_S после F+E (лог 21:48:56, 21:49:13): поворот
+        # камеры на 80-100° сразу после E срывал старт бега — персонаж стоял до повтора E.
+        # Цель была в кадре (её и кликнули в списке), зрению нужен тик-другой, чтобы её найти.
+        self._list_cam_seen_at = now
+        self._list_cam_search_started = now
+        self._list_deadline = now + self._LIST_CONFIRM_TIMEOUT_S
+        self._list_panel_before = panel_before
 
     def _search_list_wait(self, now: float, panel_info: TargetInfo, aim_info: TargetInfo) -> None:
         """
@@ -2035,32 +2764,43 @@ class FarmBot:
         """
         if not self._list_clicked:
             if now >= self._list_click_due and self.input_manager.is_idle():
-                # ПКМ, а не ЛКМ: по ПКМ на строке персонаж сразу бежит к мобу (проверил пользователь).
-                pressed = self._clicks_pressed()
-                self._list_click_press_target = None if pressed is None else pressed + 1
-                self._list_click(*self._list_target_xy)
-                self._list_clicked = True
-                self._list_cam_scanning = False
-                self._list_cam_how = None
-                self._list_cam_seen_at = float("-inf")
-                self._list_cam_search_started = now
-                self._list_deadline = now + self._LIST_CONFIRM_TIMEOUT_S
+                self._list_repick(now, "перед нажатием")
                 # Была ли панель до клика: при смене цели из боя она показывает прежнюю.
-                self._list_panel_before = panel_info.found
+                self._list_do_click(now, panel_before=panel_info.found)
             return
         tl = self._refresh_list(now)
         sel = tl.selected_row if tl is not None else None
         on_row = sel is not None and sel.index == self._list_row.index
+        # Рамка выбора встала на ДРУГУЮ строку, чем была до нажатия: игра перенумеровала список
+        # между чтением и F — это наш новый выбор, просто под другим номером (раньше ждали
+        # рамку именно на нажатой строке до 1.4 с и отправляли строку в чёрный список).
+        prev = getattr(self, "_list_prev_sel", None)
+        new_sel = sel is not None and not (
+            prev is not None and sel.index == prev[0]
+            and (sel.distance_m is None or prev[1] is None or abs(sel.distance_m - prev[1]) <= self._LIST_SAME_MOB_M))
         # Пока ждём подтверждения, камера уже ищет моба по номеру (по стрелкам здесь нельзя:
         # в поиске зрение не проверяет метку выбора, и aim_info может быть чужим).
         if self.input_manager.is_idle():
             self._list_camera(now, TargetInfo(found=False, hp_percent=0.0, offset_x=0.0, offset_y=0.0))
         # Подтверждение: рамка встала на эту строку; либо (если рамка обновляется не
         # сразу) панель появилась там, где до клика цели не было вовсе.
-        if panel_info.found and (on_row or (not self._list_panel_before and self.input_manager.is_idle())):
+        if panel_info.found and (on_row or new_sel or (not self._list_panel_before and self.input_manager.is_idle())):
             gamepad_debug_logger.debug("LIST    выбран №%d (%s) -> бой", self._list_row.index,
-                                       "рамка на строке" if on_row else "появилась панель")
+                                       "рамка на строке" if on_row else
+                                       ("рамка на №%d — список перенумеровался" % sel.index if new_sel else "появилась панель"))
             self._enter_combat(now, panel_info, aim_info, via_list=True)
+            return
+        no_result = not new_sel and (self._list_panel_before or not panel_info.found)
+        if (no_result and not getattr(self, "_list_repressed", False) and self.input_manager.is_idle()
+                and now - getattr(self, "_list_click_at", now) >= self._LIST_REPRESS_S):
+            self._list_repressed = True
+            old_idx = self._list_row.index
+            self._list_repick(now, "повтор")
+            gamepad_debug_logger.debug("LIST    F%d+E за %.1f с не взяли цель (список обновился?) — жму ещё раз: №%d",
+                                       old_idx, now - self._list_click_at, self._list_row.index)
+            deadline = self._list_deadline
+            self._list_do_click(now, panel_before=self._list_panel_before)
+            self._list_deadline = max(deadline, now + 0.9)
             return
         if now >= self._list_deadline and self.input_manager.is_idle():
             if getattr(self.input_manager, "last_click_ok", True) is False:
@@ -2074,24 +2814,77 @@ class FarmBot:
             self._set_phase(SearchPhase.TAB, now, "клик по №%d не выбрал цель — в чёрный список на %.0f с" % (
                 self._list_row.index, self._LIST_BLACKLIST_S))
 
-    def _try_list_switch(self, now: float, why: str = "HP не менялось") -> bool:
+    # ЖЕЛЕЗНОЕ ДОБИВАНИЕ по списку (просьба 2026-10-06): в списке ДОЛГО висит раненый моб (полоска
+    # под именем почти серая), а мы бьём более здорового — срочно переключаемся на раненого.
+    _WOUNDED_SWITCH_HP = 0.5          # раненый: HP строки не выше
+    _WOUNDED_SWITCH_GAP = 0.2         # наша цель здоровее раненого хотя бы на столько (0..1)
+    _WOUNDED_SEEN_S = 0.8             # раненый держится в списке столько — не мигание чтения
+    _WOUNDED_COOLDOWN_S = 3.0         # переключения не чаще — без пинг-понга
+    # Своего начатого моба НЕ бросаем (blackbox 2026-10-09 21:37:35: наша цель 43%, бот ушёл на
+    # "раненого" 15% в 13 м — это был моб другого игрока, а наш так и остался недобитым).
+    # Переключаемся на раненого, только пока наша цель почти целая (бой с ней не начат).
+    _WOUNDED_SWITCH_OURS_MIN = 0.9
+    _FOREIGN_CONFIRM_S = 0.4          # серая полоска держится столько — моб точно чужой
+    _PLAYER_BLACKLIST_S = 60.0        # строку, под которой оказался игрок, не берём минуту
+    _WOUNDED_SWITCH_MAX_M = 20        # за "раненым" дальше — не бежим (это игрок/чужой моб)
+
+    def _tick_finish_wounded(self, now: float) -> bool:
+        """
+        COMBAT, цель из списка. True — переключились на раненого (ушли в SEARCH/LIST: F+E по нему).
+        Наша цель — по панели HP (самое точное); раненый — по полоске строки списка.
+        """
+        pl = getattr(self, "_pull", None)
+        if pl is not None and pl.phase == PULL_KILL:
+            return False                          # пул, добивание у дома: порядок — ближайшая (_list_pick)
+        tl = getattr(self, "_list_last", None)
+        if tl is None or not tl.visible:
+            self._wounded_since = None
+            return False
+        cand = tl.nearest(self._list_exclude(now))
+        if (cand is None or cand.hp is None or cand.hp > self._WOUNDED_SWITCH_HP
+                or cand.distance_m is None or cand.distance_m > self._WOUNDED_SWITCH_MAX_M):
+            self._wounded_since = None
+            return False
+        since = getattr(self, "_wounded_since", None)
+        if since is None:
+            self._wounded_since = now
+            return False
+        if now - since < self._WOUNDED_SEEN_S or now < getattr(self, "_wounded_next_at", 0.0):
+            return False
+        hist = self._hp_hist
+        ours = hist[-1][1] / 100.0 if hist else 1.0
+        if ours <= cand.hp + self._WOUNDED_SWITCH_GAP:
+            return False                          # наша цель не здоровее — добиваем её
+        if ours < self._WOUNDED_SWITCH_OURS_MIN:
+            return False                          # нашу уже бьём — сначала добиваем её
+        self._wounded_next_at = now + self._WOUNDED_COOLDOWN_S
+        self._wounded_since = None
+        return self._try_list_switch(now, why="раненый №%d (HP %.0f%%, %s) висит в списке, а наша цель %.0f%% — добиваю его"
+                                     % (cand.index, cand.hp * 100,
+                                        "?" if cand.distance_m is None else "%d м" % cand.distance_m, ours * 100),
+                                     blacklist=False)
+
+    def _try_list_switch(self, now: float, why: str = "HP не менялось", blacklist: bool = True,
+                         blacklist_s: "float | None" = None) -> bool:
         """
         "HP не менялось" в бою: текущую (выбранную в списке) строку — в чёрный список,
         кликаем ближнего ДРУГОГО. True — ушли в SEARCH/LIST; False — в списке некого.
+        blacklist=False — смена на более близкую: текущую не наказываем, только не берём сейчас.
         """
-        tl = self._refresh_list(now)
+        tl = self._refresh_list(now, force=True)          # решение о смене — по свежему кадру списка
         if tl is None or not tl.visible:
             return False
         sel = tl.selected_row
         extra = {sel.index} if sel is not None else set()
         if tl.nearest(self._list_exclude(now) | extra) is None:
             return False
-        if sel is not None:
-            self.__dict__.setdefault("_list_blacklist", {})[sel.index] = now + self._LIST_BLACKLIST_S
+        if sel is not None and blacklist:
+            self.__dict__.setdefault("_list_blacklist", {})[sel.index] = now + (blacklist_s or self._LIST_BLACKLIST_S)
         gamepad_debug_logger.debug(
-            "SWITCH  %s (без урона %.1f с) — беру ближнего другого из списка (№%s в чёрный список)",
-            why, now - self._eg_wait_since, sel.index if sel is not None else "-")
-        self._bb_event(now, "list_switch", {"waited_s": now - self._eg_wait_since, "why": why,
+            "SWITCH  %s (без урона %.1f с) — беру ближнего другого из списка (№%s %s)",
+            why, now - getattr(self, "_eg_wait_since", now), sel.index if sel is not None else "-",
+            "в чёрный список" if blacklist else "не наказываем")
+        self._bb_event(now, "list_switch", {"waited_s": now - getattr(self, "_eg_wait_since", now), "why": why,
                                             "list": format_list(tl)})
         self.state = State.SEARCH
         self._cancel_queue(now)
@@ -2270,6 +3063,11 @@ class FarmBot:
         Порядок команд — "выбрали -> закрепили -> ударили"; очередь ввода
         строго последовательная, так что порядок гарантирован.
         """
+        vc = getattr(self, "_vcheck", None)
+        if vc is not None:
+            fixed = vc.status["panel"] is False
+            if vc.on_panel():
+                self._vision_check_report([("fixed", "panel")] if fixed else [])
         self.input_manager.stop_scan()
         # Выбрасываем то, что ещё стоит в очереди ввода с этапа поиска (например,
         # повтор подхода "шаг -> Tab -> ПКМ"): Tab, выполненный уже в бою,
@@ -2320,6 +3118,9 @@ class FarmBot:
         self._swap_since = None
         # И история для проверки убийства: первая точка — HP при входе.
         self._hp_hist.clear()
+        self._engage_first = None                 # пул: "первая запись" новой цели (см. _pull_combat_tick)
+        self._hp_seen_alive = False           # новая цель: её живое HP ещё не видели
+        self._corpse_txt = None               # и текст HP — с чистого листа
         self._hp_hist.append((now, panel_info.hp_percent))
         self._hp_next_sample_at = now + self._KILL_HP_SAMPLE_EVERY_S
         self.state = State.COMBAT
@@ -2333,6 +3134,7 @@ class FarmBot:
 
         # Шлагбаум: ротация закрыта до первого упавшего HP цели (см. _ENGAGE_*).
         self._engage_reset(now, panel_info)
+        self._dmg_real_at = None                   # урон прошлой цели к новой не относится (стрейфы ждут)
         if via_list:
             self._lp_best, self._lp_best_at, self._lp_in_melee = self._list_row.distance_m, now, False
             self._lp_faded_since = None
@@ -2497,6 +3299,7 @@ class FarmBot:
             self._eg_dmg_base_hp = panel_info.hp_percent
             self._eg_dmg_change_since = None
             self._eg_last_dmg_at = now
+            self._dmg_real_at = now               # настоящий урон (HP упало) — автоатака бьёт
             self._eg_retabs = 0
             self._open_gate(now, reason)
         elif now >= self._eg_deadline:
@@ -2536,6 +3339,7 @@ class FarmBot:
             self._eg_dmg_base, self._eg_dmg_base_hp = t, hp
             self._eg_dmg_change_since = None
             self._eg_last_dmg_at = now
+            self._dmg_real_at = now               # урон идёт — стрейфы разрешены (см. _hitting_since_select)
             return
         quiet = now - self._eg_last_dmg_at
         if quiet < self._ENGAGED_NO_DAMAGE_S or not self.input_manager.is_idle() or self._chain_busy(now):
@@ -2617,6 +3421,9 @@ class FarmBot:
         self._swap_next_sample_at = now
         self._swap_since = None
         self._hp_hist.clear()
+        self._engage_first = None                 # пул: "первая запись" новой цели (см. _pull_combat_tick)
+        self._hp_seen_alive = False           # новая цель: её живое HP ещё не видели
+        self._corpse_txt = None               # и текст HP — с чистого листа
         self._hp_next_sample_at = now
         if self._USE_WORLD_VISION:
             getattr(self.vision, "release_bar_lock", lambda: None)()
@@ -2683,6 +3490,28 @@ class FarmBot:
 
     # --- Охранник цели ---
 
+    # ПКМ-автоатака безопасна, если под прицелом наша цель и ДРУГИХ полосок ближе этого к прицелу
+    # нет (лог 03:29:28: соседний моб в паре десятков px — ПКМ выбрал его, и цель на 50% бросили).
+    _RMB_CLEAR_RADIUS_PX = 180.0
+
+    def _rmb_safe(self) -> bool:
+        """True — ПКМ попадёт в нашу цель: она под прицелом, а других полосок рядом нет."""
+        if not self._USE_WORLD_VISION:
+            return False
+        ai = getattr(self, "_last_aim_info", None)
+        if ai is None or not ai.found or math.hypot(ai.offset_x, ai.offset_y) > self._GUARD_AIM_TOL_PX:
+            return False
+        bars = list(getattr(self.vision, "last_bar_candidates", None) or [])
+        fn = getattr(self.vision, "bar_info", None)
+        if fn is None:
+            return False
+        near = 0
+        for b in bars:
+            bi = fn(b)
+            if bi.found and math.hypot(bi.offset_x, bi.offset_y) <= self._RMB_CLEAR_RADIUS_PX:
+                near += 1
+        return near <= 1                          # только наша (или кандидатов нет, а стрелки есть)
+
     def _guard_allows(self, now: float, action: str) -> bool:
         """
         Единый шлюз для действий, способных СМЕНИТЬ цель. True — можно.
@@ -2721,6 +3550,59 @@ class FarmBot:
 
     # --- Движение (src/core/movement.py) ---
 
+    # Наклон камеры (src/core/camera_pitch.py, 2026-10-06): калибровка — первый тик поиска и потом
+    # раз в 3-5 мин без цели (сбрасывает ошибку счёта, если игрок сам крутил камеру).
+    _PITCH_CAL_EVERY_S = (180.0, 300.0)
+    _PITCH_BACK_BIAS_S = 0.6       # регулятор упирался в низ коридора за это время -> шаг назад (<= 10 м)
+
+    def _pitch_tick(self) -> None:
+        if self.state is not State.SEARCH or not callable(getattr(type(self.input_manager), "calibrate_pitch", None)):
+            return
+        now = time.monotonic()
+        nxt = getattr(self, "_next_pitch_cal_at", 0.0)
+        st = getattr(self.input_manager, "pitch_state", None)
+        if callable(st) and nxt > now + 10.0:
+            p_deg, cal = st()
+            if p_deg is None and not cal:          # калибровку оборвала цель — точки отсчёта нет, повторим скоро
+                self._next_pitch_cal_at = nxt = now + random.uniform(5.0, 10.0)
+        if now < nxt:
+            return
+        self._next_pitch_cal_at = now + random.uniform(*self._PITCH_CAL_EVERY_S)
+        self.input_manager.calibrate_pitch()
+
+    # Проверка нажатий скиллов по откату на панели (2026-10-06): src/core/skill_check.py + vision/skill_bar.py.
+    # 2026-10-11: ВЫКЛЮЧЕНО — ротация по КД из приложения (src/core/rotation.py), фото панели больше
+    # не нужны: у друга (HDR, 2560x1440) снимки не совпадали, и готовые скиллы считались "на откате".
+    # Без проверки нет и автоснимка при старте, и фонового потока панели — минус нагрузка на процессор.
+    _SKILL_CHECK_ENABLED = False
+
+    def _make_skill_check(self) -> "PressCheckLoop | None":
+        """Проводка проверки нажатий; None — выключена флагом или нет монитора (песочница/тесты)."""
+        mon = getattr(self.vision, "_monitor", None)
+        if not self._SKILL_CHECK_ENABLED or not isinstance(mon, dict):
+            return None
+        canon = getattr(type(self.input_manager), "canonical_key", None)
+        # Подпись слота ("-", "q") -> имя клавиши ввода ("minus", "q"); dict comprehension с фильтром None.
+        keys = {canon(label) if callable(canon) else label: label for label in SKILL_BAR_SLOTS}
+        keys.pop(None, None)
+        loop = PressCheckLoop(self.input_manager, SkillBarWatcher(mon), keys, log=gamepad_debug_logger.debug)
+        # Поток панели сообщает о важном (нашёл панель по форме, снял скиллы сам, панель пропала) — в лог боя.
+        loop._w.on_event = lambda msg: gamepad_debug_logger.debug("SKILLBAR %s", msg)
+        # Поток ввода спрашивает панель перед нажатием: скилл на откате не жмём вслепую и паузу
+        # его каста не ждём (см. InputManager._defer_if_on_cd).
+        if hasattr(type(self.input_manager), "_defer_if_on_cd"):
+            self.input_manager.skill_ready_fn = loop.ready
+        loop.on_ok = self._own_cd_confirmed
+        return loop
+
+    def _skill_check_tick(self) -> None:
+        """Каждый тик: разобрать нажатия; повтор только в бою по живой цели (не по трупу/в поиске)."""
+        sc = getattr(self, "_skill_check", None)
+        if sc is None:
+            return
+        sc.tick(time.monotonic(), lambda: self.state is State.COMBAT and getattr(self, "_running", True)
+                and not self._out_of_skill_range(time.monotonic()))
+
     def _make_movement(self) -> "MovementController | None":
         """Контроллер движения, если включён и есть модель (tools/build_movement_model.py)."""
         if not self._MOVE_ENABLED:
@@ -2751,15 +3633,51 @@ class FarmBot:
         if self.state is State.COMBAT:
             if not self._MOVE_IN_COMBAT:
                 return MODE_OFF
-            if getattr(self, "_engaged", False) or getattr(self, "_lp_in_melee", False):
-                d = self._target_dist_m()
-                if d is not None and d > self._COMBAT_MOVE_MAX_M:
-                    return MODE_APPROACH           # моб ещё далеко — WASD оборвали бы бег к нему
+            if not self._list_drives():
+                # Без списка (выбор по зрению/Tab) — как раньше: бой открыт или добежали -> шаги.
+                engaged = getattr(self, "_engaged", False) or getattr(self, "_lp_in_melee", False)
+                return MODE_COMBAT if engaged else MODE_APPROACH
+            # Список: стрейфим, когда автоатака уже бьёт — после последнего F+E по цели был
+            # настоящий урон. До него персонаж бежит к цели сам, и A/D оборвали бы этот бег —
+            # но ТОЛЬКО пока он правда бежит (просьба 2026-10-05 "всегда в движении, никаких
+            # остановок"): встал (дошёл до дистанции удара / E не сработал) -> стрейфы.
+            # ЛОГ 22:42:14-16: стрейфы при "медленном старте" бега (0.6 с) обрывали сам бег — A/D
+            # отменяют автобег игры к цели, персонаж топтался на 27-29 м. Поэтому до урона ноги
+            # не трогаем никогда; "всегда в движении" здесь = бег к цели, а если он встал —
+            # E ещё раз через ~0.5 с (_tick_attack_retry), это и есть самое быстрое движение к мобу.
+            # 2026-10-06 ("иногда стоит на месте"): до урона ноги ждут, ТОЛЬКО пока персонаж правда
+            # бежит к цели. Метры не уменьшились на 1 м за разгон (_RUN_START_GRACE_S) или бег встал
+            # дольше _RUN_STALL_S -> боевые шаги (без S, к цели и вбок); дальний случай добивает
+            # повтор E (_tick_attack_retry) — он сбрасывает _last_select_at, и ноги снова ждут бега.
+            # "Всегда в движении, нон-стоп" (2026-10-06, лог 04:11:42-46: после повтора E ноги стояли
+            # ~3.5 с). Ноги отдыхают ТОЛЬКО пока персонаж бежит к цели сам (автобег после F+E, он и
+            # есть движение). Бег не начался за разгон (_RUN_START_GRACE_S) -> двигаемся сами: шаги
+            # W/A/D, а если цель дальше дальности скиллов и в кадре — с упором вперёд (set_fwd_bias,
+            # см. _movement_tick): W ведёт к ней, раз камера на ней. Взяли ноги на себя — до нового
+            # выбора/повтора E обратно не отдаём: иначе свой же бег на W читался бы как "автобег",
+            # ноги отпускались, персонаж вставал — и так по кругу.
+            now = time.monotonic()
+            if self._hitting_since_select():
                 return MODE_COMBAT
-            return MODE_APPROACH
+            last = getattr(self, "_last_select_at", None)
+            if getattr(self, "_legs_own_ref", None) == last:
+                return MODE_COMBAT
+            d = self._target_dist_m()
+            rng = self._attack_range_m()
+            if d is not None and d <= (rng if rng is not None else self._ATTACK_FAR_DEFAULT_M):
+                return MODE_COMBAT                # цель уже в дальности скиллов — бежать некуда, шагаем сразу
+            if self._running_to_target(now):
+                return MODE_APPROACH
+            self._legs_own_ref = last
+            gamepad_debug_logger.debug("MOVE    автобег не начался за %.1f с — двигаюсь сам (к цели, если она в кадре)",
+                                       self._RUN_START_GRACE_S)
+            return MODE_COMBAT
         phase = getattr(self, "_search_phase", None)
         if phase is SearchPhase.LIST:
-            return MODE_SELECT if self._select_strafe_ok() else MODE_OFF
+            # До нажатия F+E — стрейфы; после — персонаж бежит к цели сам (A/D оборвали бы бег).
+            if self._select_strafe_ok():
+                return MODE_SELECT
+            return MODE_APPROACH
         if phase is SearchPhase.APPROACH:
             return MODE_OFF
         if phase is SearchPhase.ROAM:
@@ -2767,6 +3685,24 @@ class FarmBot:
             # Без живого одометра прогулка вслепую увела бы далеко — тогда просто "живём" на месте.
             return MODE_ROAM if nav is not None and nav.available(time.monotonic()) else MODE_SEARCH
         return MODE_SEARCH
+
+    def _list_select(self, row, xy: "tuple[float, float] | None" = None) -> None:
+        """
+        Выбрать строку списка и атаковать её. Бинды (2026-10-05): F{номер строки} + E —
+        без мыши и Alt, персонаж не стоит, пока выбирает цель. Нет биндов (выключено или
+        ввод их не умеет — заглушки тестов) — по-старому Alt+ПКМ по строке.
+        """
+        # Новый выбор (F+E / клик) = персонаж снова бежит к цели: стрейфы ждут нового урона.
+        self._last_select_at = time.monotonic()
+        if (self._TARGET_KEYS_ENABLED and 1 <= row.index <= 8
+                and getattr(type(self.input_manager), "TARGET_KEYS_SUPPORTED", False)):
+            self.input_manager.select_target(row.index, self._TARGET_ATTACK_KEY)
+            return
+        if xy is None:
+            jx, jy = self._LIST_JITTER_PX
+            px, py = row.click_point
+            xy = self.vision.list_point_to_screen((px + random.uniform(-jx, jx), py + random.uniform(-jy, jy)))
+        self._list_click(*xy)
 
     def _list_click(self, x: float, y: float) -> None:
         """
@@ -2777,6 +3713,42 @@ class FarmBot:
             self.input_manager.click_at(x, y, button="right", strafe=True)
         else:
             self.input_manager.click_at(x, y, button="right")
+
+    # "Всегда в движении" (2026-10-05): после F+E/клика даём персонажу столько, чтобы побежать
+    # сам; бег = метры строки цели падают быстрее _ATTACK_RUN_MIN_MPS; не падали дольше
+    # _RUN_STALL_S — стоит, ноги снова стрейфят (E-повтор сам отпускает клавиши перед нажатием).
+    _RUN_START_GRACE_S = 1.0           # разгон: E -> персонаж разворачивается и бежит, первый метр списка
+    _RUN_STALL_S = 0.4
+
+    def _running_to_target(self, now: float) -> bool:
+        """Персонаж сейчас бежит к цели сам (после F+E) — тогда WASD не жмём, чтобы не оборвать бег."""
+        last = getattr(self, "_last_select_at", None)
+        if last is None:
+            return False
+        self._track_run(now)                       # и во время разгона: первый метр уже считается
+        if now - last < self._RUN_START_GRACE_S:
+            return True
+        seen = getattr(self, "_run_seen_at", None)
+        return seen is not None and seen >= last and now - seen <= self._RUN_STALL_S
+
+    def _track_run(self, now: float) -> None:
+        """Метры выбранной строки списка быстро падают -> отметка "бежим" (_run_seen_at)."""
+        last = getattr(self, "_last_select_at", None)
+        tl = getattr(self, "_list_last", None)
+        sel = tl.selected_row if tl is not None and getattr(tl, "visible", False) else None
+        d = sel.distance_m if sel is not None else None
+        if getattr(self, "_run_ref", None) != last:
+            self._run_ref, self._run_best = last, None
+        if d is None:
+            return
+        best = getattr(self, "_run_best", None)
+        if best is None or d > best[0]:
+            self._run_best = (d, now)
+            return
+        if d <= best[0] - 1:
+            if (best[0] - d) / max(0.05, now - best[1]) >= self._ATTACK_RUN_MIN_MPS:
+                self._run_seen_at = now
+            self._run_best = (d, now)
 
     def _select_strafe_ok(self) -> bool:
         """Фаза LIST: стрейфим, пока клик по строке ещё не нажат (потом персонаж бежит сам)."""
@@ -2793,13 +3765,75 @@ class FarmBot:
         v = getattr(self.input_manager, "clicks_pressed", None)
         return v if isinstance(v, int) else None
 
+    # Шаги назад в бою — только если цель не дальше этого (просьба 2026-10-06): дальше пятиться
+    # нельзя, выйдем из дальности скиллов (15 м). Метры неизвестны — тоже нельзя.
+    _BACK_STRAFE_MAX_M = 10
+
     def _movement_tick(self) -> None:
         mv = getattr(self, "movement", None)
         if mv is not None:
             mode = self._movement_mode()
             mv.set_mode(mode)
             if hasattr(mv, "set_sprint"):
-                mv.set_sprint(mode == MODE_APPROACH and self._SPRINT_ENABLED and self._want_sprint())
+                home_run = mode == MODE_ROAM and self._HOME_SPRINT and self._home_trip_active()
+                mv.set_sprint(home_run or (mode == MODE_APPROACH and self._SPRINT_ENABLED and self._want_sprint()))
+            if hasattr(mv, "set_back_allowed"):
+                d = self._target_dist_m()
+                back = d is not None and d <= self._BACK_STRAFE_MAX_M
+                home_vec = self._pull_home_vec(mode)
+                if hasattr(mv, "set_home_bias"):
+                    mv.set_home_bias(home_vec)
+                if home_vec is not None and home_vec[0] < -0.3:
+                    back = True                   # дом за спиной — шаг назад и есть путь домой
+                mv.set_back_allowed(back)
+                if hasattr(mv, "set_fwd_bias"):
+                    mv.set_fwd_bias(mode == MODE_COMBAT and self._approach_on_foot(d))
+                if hasattr(mv, "set_back_bias"):
+                    # Моб ниже прицела, а камере ниже нельзя (коридор наклона): отступить на шаг —
+                    # моб на экране поднимется к прицелу. Только там, где назад и так разрешено.
+                    blocked = getattr(self.input_manager, "pitch_blocked_at", float("-inf"))
+                    mv.set_back_bias(back and mode == MODE_COMBAT
+                                     and time.monotonic() - blocked < self._PITCH_BACK_BIAS_S)
+
+    def _pull_home_vec(self, mode: str) -> "tuple[float, float] | None":
+        """
+        Пул, добивание в бою дальше kill_move_free_m от дома: направление на дом в осях камеры
+        (вперёд, вправо). Курс камеры — Navigator.camera_heading (последний замер + повороты мыши);
+        неизвестен — None (обычные шаги, а от ухода далеко страхует поводок kill_leash_m).
+        """
+        pl = getattr(self, "_pull", None)
+        nav = getattr(self, "navigator", None)
+        if pl is None or nav is None or pl.phase != PULL_KILL or mode != MODE_COMBAT:
+            return None
+        if nav.dist_home_m() <= pl.t.kill_move_free_m:
+            return None
+        yaw_fn = getattr(self.input_manager, "camera_yaw_counts", None)
+        cam = nav.camera_heading(yaw_fn() if yaw_fn is not None else None, time.monotonic())
+        if cam is None:
+            return None
+        x, y = nav.pos
+        hx, hy = nav.home
+        want = math.degrees(math.atan2(hx - x, -(hy - y))) % 360.0   # как bearing_deg: 0° — вверх карты
+        rel = math.radians(wrap180(want - cam))
+        return math.cos(rel), math.sin(rel)
+
+    _FWD_AIM_FRAC = 0.2            # цель не дальше этой доли ширины экрана от центра -> W ведёт к ней
+
+    def _approach_on_foot(self, d: "int | None") -> bool:
+        """
+        Сближаться ногами (W): урона ещё нет, цель дальше дальности скиллов, и камера на ней
+        (видели в кадре у центра за последние 0.5 с). Цель не в кадре — W увёл бы не туда.
+        """
+        if d is None or self.state is not State.COMBAT or self._hitting_since_select():
+            return False
+        rng = self._attack_range_m()
+        if d <= (rng if rng is not None else self._ATTACK_FAR_DEFAULT_M):
+            return False
+        seen = getattr(self, "_cam_last_dx", None)
+        if seen is None or time.monotonic() - seen[1] > 0.5:
+            return False
+        w = float(getattr(self.vision, "screen_w", 1920) or 1920)
+        return abs(seen[0]) <= self._FWD_AIM_FRAC * w
 
     def _want_sprint(self) -> bool:
         """Цель из списка дальше _SPRINT_START_M — бежим в шифте; ближе _SPRINT_STOP_M — нет."""
@@ -2817,6 +3851,575 @@ class FarmBot:
         self._sprint_on = on
         return on
 
+    # --- Режим "пул" (ТЕСТ 2026-10-13, src/core/pull.py) ---
+    # Цикл: KILL (у дома) -> GATHER (тычки) -> RETURN (домой) -> KILL. Логика фаз — PullPlanner,
+    # здесь только связь с FSM: SEARCH (выбор цели, бег домой) и COMBAT (тычка -> следующий/домой).
+    # Все строки лога — с меткой PULL; итог — в таблице сессии на "Стоп".
+
+    def _pull_start(self) -> None:
+        nav = getattr(self, "navigator", None)
+        mode = getattr(self, "pull_mode", None)   # из окна программы; None — по умолчанию класса
+        enabled = self._PULL_MODE if mode is None else bool(mode)
+        self._pull = PullPlanner() if enabled and nav is not None else None
+        if self._pull is None:
+            gamepad_debug_logger.debug("PULL    режим: обычный фарм (бьём всех подряд, без агра)")
+            return
+        nav.anchor = nav.home                     # прогулка на сборе — вокруг дома, не вокруг убийства
+        t = self._pull.t
+        gamepad_debug_logger.debug("PULL    режим пул ВКЛ: сбор до %.0f м от дома, мобы до %.0f м, тычек за "
+                                   "сбор %d, драка у дома — цели до %.0f м от дома, сам не дальше %.0f м, зона лута %.0f м",
+                                   t.run_m, t.tag_m, t.max_tags, t.kill_zone_m, t.kill_leash_m, t.loot_m)
+
+    def _pull_plan_ready(self, now: float, tl) -> bool:
+        """
+        Сбор после R: таблица дочиталась (пустые кадры перерисовки — не "мобов нет") — снимаем её:
+        дальше в этом сборе тычем только этих (фильтр — PullPlanner.excluded). True — снимок есть.
+        Зовётся из общего фильтра _list_exclude — поэтому снимок видят ВСЕ пути выбора цели.
+        """
+        pl = self._pull
+        if pl.plan is not None:
+            if tl is not None and getattr(tl, "visible", False) and pl.adopt_rows(tl.rows):
+                gamepad_debug_logger.debug("PULL    снимок был пустой, строки появились — беру их без R: %s",
+                                           ", ".join("№%d" % i for i in sorted(pl.plan)))
+            return True
+        if pl.need_eagle:
+            return False                          # R ещё не нажат (нажмёт _pull_search_tick)
+        rows = tl.rows if tl is not None and getattr(tl, "visible", False) else []
+        if not pl.eagle_settled(now, rows):
+            return False
+        plan = pl.take_plan()
+        gamepad_debug_logger.debug("PULL    снимок таблицы после R: %s — тычу ближних, всего до %d",
+                                   ", ".join("№%d" % i for i in sorted(plan)) or "пусто", pl.t.max_tags)
+        return True
+
+    def _pull_panel_stranger(self, panel_info) -> bool:
+        """Выбранная цель — чужой моб (полное HP, без мечей, не наш по строке таблицы)? См. PullPlanner.stranger."""
+        pl = getattr(self, "_pull", None)
+        if pl is None or not panel_info.found:
+            return False
+        tl = getattr(self, "_list_last", None)
+        sel = tl.selected_row if tl is not None and getattr(tl, "visible", False) else None
+        return pl.stranger(panel_info.hp_percent, sel, self.navigator.dist_home_m())
+
+    def _pull_hold(self) -> None:
+        """Стоим дома (ждём таблицу после R / некого бить): без осмотра камерой и прогулки."""
+        im = self.input_manager
+        im.stop_scan()
+        im.stop_sweep()
+        im.clear_aim_target()
+
+    def _pull_search_tick(self, now: float) -> bool:
+        """SEARCH вне боя. True — тик занят пулом (ждём у дома / ушли домой), False — обычный выбор цели."""
+        pl = getattr(self, "_pull", None)
+        if pl is None:
+            return False
+        tl = self._refresh_list(now)
+        has = bool(tl is not None and tl.visible and tl.nearest(self._list_exclude(now)) is not None)
+        dist = self.navigator.dist_home_m()
+        if pl.eagle_pending:
+            self._pull_hold()                     # камера едет вниз на персонажа — стоим, R нажмём в позе
+            self._pull_eagle_tick(now)
+            return True
+        if pl.kill_too_far(dist):
+            self._pull_go_home(now, "добивание: ушёл на %.0f м (> %.0f м)" % (dist, pl.t.kill_leash_m), leash=True)
+            return True
+        if pl.phase == PULL_KILL:
+            if pl.verifying:
+                # R нажат проверкой — ждём, пока свежая таблица дочитается, и решаем по ней.
+                if not pl.eagle_settled(now, tl.rows if tl is not None and tl.visible else []):
+                    self._pull_hold()
+                    return True
+                if has:
+                    pl.verifying, pl.kill_idle_since = False, None
+                    gamepad_debug_logger.debug("PULL    свежая таблица: у дома ещё есть кого бить — добиваю")
+                    return False
+                lost = pl.close_cycle()
+                pl.start_gather(now, fresh=True)
+                gamepad_debug_logger.debug("PULL    свежая таблица: у дома пусто — сбор по ней без второго R "
+                                           "(снимок: %s; прошлый цикл: тычкнутых не добито %d)",
+                                           ", ".join("№%d" % i for i in sorted(pl.plan)) or "пусто", lost)
+                return False
+            if pl.kill_idle(now, has):
+                # Таблица без автообновления: подошедших после прошлого R в ней нет. Прежде чем уходить —
+                # R и смотрим свежую (0.4 с; R без КД). Нашлись раненые/с мечами — бой продолжается.
+                if self._pull_eagle_at_home(now, "у дома пусто %.1f с — проверяю свежей таблицей" % pl.t.kill_idle_s):
+                    pl.verifying = True
+                    self._pull_hold()
+                return True
+            if not has:
+                # Ждём у дома: обычный путь через 2 с пустого списка ушёл бы гулять — а нам стоять.
+                self._pull_hold()
+                return True
+            return False
+        if pl.phase == PULL_GATHER:
+            rows = tl.rows if tl is not None and tl.visible else []
+            if pl.need_eagle:
+                self._pull_eagle_at_home(now, "добор у дома" if pl.topup else "новый сбор")
+                return True
+            if not pl.topup:
+                if not self._pull_plan_ready(now, tl):
+                    self._pull_hold()
+                    return True
+                has = bool(tl is not None and tl.visible and tl.nearest(self._list_exclude(now)) is not None)
+            if not has and pl.tags == 0:
+                # Из снимка тыкать некого — стоим дома, а не гуляем; R ещё раз: таблица пустая — через 2 с,
+                # мобы есть, но далеко — через 5 с (их метры и так обновляются, R нужен только для новых).
+                self._pull_hold()
+                if pl.eagle_empty_retry(now, bool(rows)):
+                    self._pull_eagle_at_home(now, "тыкать некого — стою дома, обновляю таблицу")
+                return True
+        if pl.phase == PULL_GATHER and pl.topup:
+            if not has or pl.tags >= pl.t.max_tags:
+                pl.finish_topup(now)
+                gamepad_debug_logger.debug("PULL    добор у дома: %s — добиваю %d", "рядом больше некого" if not has
+                                           else "набрал", pl.tags)
+                return False
+            return False                          # кандидат есть — обычный выбор цели (фильтр добора)
+        train = pl.train(tl.rows) if tl is not None and tl.visible else pl.tags
+        if pl.phase == PULL_GATHER and train >= pl.t.max_tags:
+            # Напавшие сами (мечи) — уже в паровозе: не дерёмся с ними тут, а ведём домой вместе со всеми.
+            self._pull_go_home(now, "паровоз набран: тычек %d + напали сами %d" % (pl.tags, train - pl.tags))
+            return True
+        if pl.phase == PULL_GATHER and pl.gather_should_return(now, dist, has):
+            why = ("убежал на %.0f м" % dist if dist > pl.t.run_m
+                   else "тыкать больше некого" if not has else "время сбора вышло")
+            self._pull_go_home(now, why)
+            return True
+        return False
+
+    def _pull_combat_tick(self, now: float, panel_info) -> bool:
+        """
+        COMBAT на сборе: HP цели упало от входа в бой — тычка есть, дальше следующий моб или домой.
+        Тычка считается ОДИН раз на цель: ключ — первая запись _hp_hist (её создаёт вход в бой), та же
+        запись = та же цель (тест 2026-10-13: бот вернулся к уже тычкнутому и засчитал его вторично).
+        Следующего ищем до _PULL_NEXT_WAIT_S: одно пустое чтение списка (мигнул) — не повод идти домой
+        (тот же тест: "LIST пусто" ровно в момент тычки -> "домой, следующего нет" при 7 мобах вокруг).
+        """
+        pl = getattr(self, "_pull", None)
+        if pl is not None and pl.eagle_pending:
+            self._pull_eagle_cancel()
+        if pl is not None and pl.kill_too_far(self.navigator.dist_home_m()):
+            # Добивание у дома: подход/автобег за целью увёл дальше kill_leash_m — назад к дому,
+            # цель не бросаем (она и остальные бегут следом), у дома бой продолжится по панели.
+            self._pull_leave_combat(now, "в драке ушёл на %.0f м (> %.0f м)" % (
+                self.navigator.dist_home_m(), pl.t.kill_leash_m), leash=True)
+            return True
+        if pl is not None and pl.phase == PULL_KILL:
+            tl = getattr(self, "_list_last", None)
+            sel = tl.selected_row if tl is not None and getattr(tl, "visible", False) else None
+            if self._pull_panel_stranger(panel_info):
+                since = getattr(self, "_pull_stranger_since", None)
+                if since is None:
+                    self._pull_stranger_since = since = now
+                if now - since >= pl.t.stranger_s:
+                    # Лог 00:25:23: дом зачищен, игра выделила свежего моба — бот 10 с бегал за ним с Tab,
+                    # "дома пусто" не наступало, R не было. Выходим из боя БЕЗ Tab (Tab выбрал бы другого):
+                    # поиск чужую панель не берёт, через kill_idle_s — R и новый сбор.
+                    self._pull_stranger_since = None
+                    if sel is not None:
+                        # Её строку — в чёрный список: иначе правило "вплотную без HP — добиваем" (kill_near_m)
+                        # выбрало бы её снова, и "дома пусто" так и не наступило бы.
+                        self.__dict__.setdefault("_list_blacklist", {})[sel.index] = now + self._LIST_BLACKLIST_S
+                    gamepad_debug_logger.debug("PULL    у дома цель №%s с полным HP без мечей %.1f с — не наша, "
+                                               "выхожу из боя", sel.index if sel is not None else "?", pl.t.stranger_s)
+                    self._pull_exit_combat(now)
+                    return True
+            else:
+                self._pull_stranger_since = None
+            if pl.target_left_zone(sel, self.navigator.dist_home_m()):
+                # Привезённый моб отагрился и уходит (2026-10-13: "за ней не бежит, а убивает тех,
+                # кого запулил"). Его номер — в чёрный список, бьём ближайшего из зоны.
+                why = "PULL цель №%d ушла за зону (%d м от бота, до дома %.0f м) — бросаю" % (
+                    sel.index, sel.distance_m, self.navigator.dist_home_m())
+                if self._try_list_switch(now, why=why, blacklist=True):
+                    return True
+                if self.state == State.COMBAT:
+                    # В зоне больше некого — бой с ушедшим не продолжаем, но и сбор сразу не начинаем:
+                    # снимаем цель (Tab, как с недостижимой), дальше добивание само решит — есть ли
+                    # ещё кто бьёт нас/ранен рядом, а если нет — через kill_idle_s сбор.
+                    if sel is not None:
+                        self.__dict__.setdefault("_list_blacklist", {})[sel.index] = now + self._LIST_BLACKLIST_S
+                    gamepad_debug_logger.debug("%s; другой цели нет — снимаю цель", why)
+                    self._engage_abort(now)
+                    return True
+                return False
+        if pl is not None and pl.phase == PULL_GATHER and self.navigator.dist_home_m() > pl.t.run_m:
+            # Сбор: автобег за целью увёл дальше run_m (лог 2026-10-13 06:15: тычка №4 на 44 м от дома,
+            # обратно 9 с) — сразу домой с тем, кого уже тычкнули. Проверка была только вне боя.
+            self._pull_leave_combat(now, "сбор: убежал на %.0f м (> %.0f м)" % (
+                self.navigator.dist_home_m(), pl.t.run_m))
+            return True
+        if pl is None or pl.phase != PULL_GATHER or not panel_info.found or not self._hp_hist:
+            return False
+        tl = getattr(self, "_list_last", None)
+        # Ключ цели — ПЕРВАЯ запись HP этой цели, запомненная один раз. Брать _hp_hist[0] каждый тик
+        # нельзя: история HP — скользящее окно, старые записи выпадают, и [0] "менялся" — одна и та же
+        # цель засчитывалась тычкой 3 раза за 0.15 с (лог 2026-10-13 07:14:27, "тычка №2/3/4 по №1").
+        sel = tl.selected_row if tl is not None and getattr(tl, "visible", False) else None
+        sel_idx = sel.index if sel is not None else None
+        if getattr(self, "_engage_first", None) is None or self._engage_first[1] <= 1.0:
+            # HP 0% сразу после выбора — панель ещё не дочиталась (лог 01:30:27: 4 живых моба в 22-25 м
+            # подряд "уже тычкнуты (HP 0%)" — 2 с впустую). Ключ — первая запись с HP > 1%; 0% держится
+            # _PULL_CORPSE_S — это труп в таблице: бросаем.
+            first = next((h for h in self._hp_hist if h[1] > 1.0), None)
+            if first is None:
+                # HP панели не читается (лог 02:15:18: живой моб в 23 м, панель "0%, текста нет"). Тычку
+                # видно и без неё — по строке таблицы: мечи или HP строки упало. Есть — засчитываем;
+                # нет — ждём, а трупом считаем только через _PULL_CORPSE_S (было 0.6 с — бросали живых).
+                row_seen = sel is not None and (getattr(sel, "attacking", False)
+                                                or (sel.hp is not None and sel.hp < pl.t.full_hp))
+                if not row_seen:
+                    if now - self._hp_hist[0][0] >= self._PULL_CORPSE_S:
+                        self._pull_drop_tag_target(now, sel, "HP 0%% %.1f с и строка не тронута — труп" % (
+                            now - self._hp_hist[0][0]))
+                        return True
+                    return False
+                first = (self._hp_hist[0][0], 100.0)   # HP не знаем, но строка говорит "тронут" — тычка
+            self._engage_first = first
+        key = self._engage_first
+        if getattr(self, "_pull_tagged_key", None) is not key and key[1] < pl.t.full_hp * 100.0:
+            # Вход в бой с уже раненым мобом — он тычкнут раньше (HP строки списка не прочиталось, а
+            # панель HP точная). Вторую тычку не считаем, сразу ищем следующего (тест 2026-10-13:
+            # "тычка №3 (HP 73% -> 71%)" — тот же моб второй раз).
+            self._pull_tagged_key = key
+            self._pull_next_until = now + self._PULL_NEXT_WAIT_S
+            pl.mark_tagged(sel_idx, sel.distance_m if sel is not None else None, now)
+            gamepad_debug_logger.debug("PULL    цель №%s уже тычкнута (HP %.0f%%) — не считаю, следующий",
+                                       sel_idx if sel_idx is not None else "?", key[1])
+        if getattr(self, "_pull_tagged_key", None) is not key:
+            att = getattr(self, "_pull_attempt", None)
+            if att is None or att[0] is not key:
+                # Новая цель — новая попытка (key[0] — время входа в бой с ней), см. PullPlanner.tag_hopeless.
+                self._pull_attempt = att = (key, TagAttempt(entered_at=key[0]))
+            why = pl.tag_hopeless(sel, now, att[1])
+            if why is not None:
+                self._pull_drop_tag_target(now, sel, why)
+                return True
+            start = key[1]
+            hit = start - panel_info.hp_percent >= self._PULL_TAG_DROP_PCT
+            # HP строки таблицы упало (выбирали целого — тычкнутых на сборе не берём): удар дошёл, даже
+            # если панель ещё не показала падение на _PULL_TAG_DROP_PCT.
+            hit = hit or (sel is not None and sel.hp is not None and sel.hp < pl.t.full_hp)
+            # Мечи у выбранной строки — моб уже агрится на нас: тычка есть, даже если удар ещё
+            # не долетел (быстрее на время замаха, ~0.3-0.8 с на каждого).
+            aggro = sel is not None and getattr(sel, "attacking", False)
+            if not hit and not aggro:
+                return False
+            self._pull_tagged_key = key
+            self._pull_next_until = now + self._PULL_NEXT_WAIT_S
+            done = pl.on_tag(now, sel_idx, sel.distance_m if sel is not None else None)
+            if not done and tl is not None and getattr(tl, "visible", False) and pl.train(tl.rows) >= pl.t.max_tags:
+                done = True                       # с напавшими сами паровоз уже полный
+            gamepad_debug_logger.debug("PULL    тычка №%d по строке №%s (%s), до дома %.0f м%s", pl.tags,
+                                       sel_idx if sel_idx is not None else "?",
+                                       "HP %.0f%% -> %.0f%%" % (start, panel_info.hp_percent) if hit else "моб агрится — мечи",
+                                       self.navigator.dist_home_m(), " — сбор окончен" if done else " — следующий")
+            if done:
+                if pl.topup:
+                    pl.finish_topup(now)
+                    gamepad_debug_logger.debug("PULL    добор у дома: набрал %d — добиваю здесь", pl.tags)
+                    return False
+                self._pull_leave_combat(now, "тычек %d" % pl.tags)
+                return True
+        # Текущая цель уже тычкнута — на следующего из снимка (R посреди сбора не жмём — см. PullTuning).
+        if self._pull_try_next(now):
+            return True
+        if pl.topup:
+            # Добор у дома: следующего рядом нет — не ждём, добиваем (текущую цель тоже).
+            pl.finish_topup(now)
+            gamepad_debug_logger.debug("PULL    добор у дома: рядом больше некого — добиваю %d", pl.tags)
+            return False
+        if pl.plan_exhausted() or self._pull_none_left(now):
+            # Со снимком "следующего нет" — это факт, а не мигание таблицы: домой сразу (было +1.5 с).
+            self._pull_leave_combat(now, "снимок исчерпан: тычек %d" % pl.tags)
+            return True
+        if now >= self._pull_next_until:
+            self._pull_leave_combat(now, "после тычки следующего нет %.1f с" % self._PULL_NEXT_WAIT_S)
+            return True
+        return False                              # таблица мигнула (пустое чтение) — пробуем на следующем тике
+
+    def _pull_eagle(self, now: float, why: str) -> None:
+        """
+        Орлиное зрение (R). Скан идёт там, где прицел (2026-10-14, от игрока) — поэтому сначала камера
+        вниз до упора: прицел на персонаже, скан накрывает всё вокруг него. Нажатие — в _pull_eagle_tick,
+        когда поза встала (или не встала за eagle_floor_max_s — тогда как есть).
+        """
+        pl = self._pull
+        im = self.input_manager
+        if pl.eagle_pending:
+            return
+        pose = pl.t.eagle_floor and hasattr(im, "pitch_scan_start")
+        if pose:
+            im.pitch_scan_start()
+        pl.eagle_pending, pl.need_eagle = True, False
+        self._pull_eagle_req = (now, why, pose)
+        self._pull_eagle_tag = None
+        self._pull_eagle_tick(now)                # без позы и при свободном вводе R уходит сразу, без лишнего тика
+
+    def _pull_eagle_at_home(self, now: float, why: str) -> bool:
+        """
+        R — только у самого дома (eagle_home_m): скан идёт вокруг прицела, т.е. вокруг персонажа, и
+        должен накрыть дом. Дальше — сначала шаг к центру дома (один раз; не дошли за
+        eagle_home_trip_s — R где стоим). True — R заказан; False — идём к дому, R после.
+        """
+        pl = self._pull
+        dist = self.navigator.dist_home_m()
+        if dist > pl.t.eagle_home_m and not getattr(self, "_pull_center_tried", False):
+            self._pull_center_tried = True
+            pl.start_return(now, center=True)
+            self._home_arrive_now_m = pl.t.eagle_home_m
+            gamepad_debug_logger.debug("PULL    перед R — к центру дома (%.0f м > %.0f м)", dist, pl.t.eagle_home_m)
+            self._start_home_trip(now)
+            self._home_trip_deadline = now + pl.t.eagle_home_trip_s
+            return False
+        self._pull_center_tried = False
+        self._pull_eagle(now, why)
+        return True
+
+    def _pull_eagle_tick(self, now: float) -> None:
+        """
+        R заказан. Шаги: камера в упоре (или не встала за eagle_floor_max_s) -> ввод свободен -> R в
+        очередь с меткой -> клавиша РЕАЛЬНО нажата (combo_done) -> с этого момента читаем таблицу и
+        камера идёт назад. Лог 02:09:04: R ждал конца нажатия "6", камеру уже подняли, а таблицу читали
+        старую — снимок из 2 мобов при полном доме. Теперь всё считается от настоящего нажатия.
+        """
+        pl = self._pull
+        im = self.input_manager
+        t0, why, pose = getattr(self, "_pull_eagle_req", (now, "?", False))
+        tag = getattr(self, "_pull_eagle_tag", None)
+        if tag is not None:
+            done = getattr(im, "combo_done", None)
+            if done is not None and not done(tag) and now - self._pull_eagle_sent < self._PULL_EAGLE_PRESS_MAX_S:
+                return                            # R ещё в очереди — камера стоит внизу, таблицу не читаем
+            self._pull_eagle_tag = None
+            pl.eagle_pending = False
+            pl.on_eagle(time.monotonic())         # таблица перерисуется ПОСЛЕ этого нажатия
+            self.__dict__.setdefault("_list_blacklist", {}).clear()   # номера после R другие
+            self._list_next_read_at = pl.eagle_until
+            if pose:
+                im.pitch_scan_release(pl.t.eagle_floor_hold_s)
+            return
+        floor = im.pitch_at_floor() if pose else True
+        waited = now - t0
+        if not floor and waited < pl.t.eagle_floor_max_s:
+            return
+        idle = getattr(im, "is_idle", lambda: True)()
+        if not idle and waited < pl.t.eagle_floor_max_s + self._PULL_EAGLE_IDLE_MAX_S:
+            return                                # идёт другое нажатие ("6", зажатие) — R после него, в позе
+        self._pull_eagle_press(now, why if floor else why + "; камера не встала вниз — жму как есть")
+
+    def _pull_eagle_cancel(self) -> None:
+        """Заказанный R отменяем (вошли в бой): камеру назад, проверку/снимок — заново позже."""
+        pl = self._pull
+        if not pl.eagle_pending:
+            return
+        self._pull_eagle_tag = None
+        pl.eagle_pending = pl.verifying = False
+        if pl.phase == PULL_GATHER and pl.plan is None:
+            pl.need_eagle = True
+        self.input_manager.pitch_scan_release(0.0)
+        gamepad_debug_logger.debug("PULL    орлиное зрение отменено: начался бой")
+
+    def _pull_eagle_press(self, now: float, why: str) -> None:
+        """R первым в очередь ввода (execute_combo_now) с меткой: когда клавиша реально нажата —
+        увидит _pull_eagle_tick (combo_done) и только тогда начнёт ждать новую таблицу."""
+        pl = self._pull
+        im = self.input_manager
+        tag = ("eagle", now)
+        press = getattr(im, "execute_combo_now", None) or im.execute_combo
+        press(["press_" + pl.t.eagle_key], tag=tag)
+        self._pull_eagle_tag, self._pull_eagle_sent = tag, now
+        gamepad_debug_logger.debug("PULL    орлиное зрение (%s): %s", pl.t.eagle_key.upper(), why)
+        if not hasattr(im, "combo_done"):
+            self._pull_eagle_tick(now)            # ввод без подтверждений (тест/заглушка) — считаем нажатым
+
+    def _pull_drop_tag_target(self, now: float, sel, why: str) -> None:
+        """Сбор: цель не тычется (убегает / не достать) — её номер в чёрный список и дальше: следующая,
+        иначе домой с тем, кого уже тычкнули, иначе Tab (как с недостижимой, см. _engage_abort)."""
+        pl = self._pull
+        if sel is not None:
+            self.__dict__.setdefault("_list_blacklist", {})[sel.index] = now + pl.t.drop_blacklist_s
+            pl.drop_from_plan(sel.index)
+        gamepad_debug_logger.debug("PULL    бросаю цель №%s: %s", sel.index if sel is not None else "?", why)
+        if self._pull_try_next(now):
+            return
+        if pl.topup:
+            pl.finish_topup(now)
+            gamepad_debug_logger.debug("PULL    добор у дома: %s, больше некого — добиваю %d", why, pl.tags)
+            return
+        if pl.tags > 0:
+            self._pull_leave_combat(now, "%s, тыкать больше некого" % why)
+        else:
+            self._engage_abort(now)
+
+    def _pull_try_next(self, now: float) -> bool:
+        """Смена на следующего нетычкнутого (фильтр пула — в _list_exclude). True — F+E по нему ушли."""
+        switched = self._try_list_switch(now, why="PULL тычка есть — следующий", blacklist=False)
+        if not switched and self.state == State.SEARCH:
+            # Следующий ЕСТЬ (switch уже перевёл в SEARCH), но клик отложен: ввод ещё жмёт скилл.
+            # Ждать тик нельзя — в фазе TAB панель с ПРЕЖНЕЙ (уже тычкнутой) целью вернула бы бой с
+            # ней же. Поэтому immediate=True: F+E встают в очередь сразу за текущим нажатием.
+            tl = getattr(self, "_list_last", None)
+            sel = tl.selected_row if tl is not None and getattr(tl, "visible", False) else None
+            switched = self._try_list_target(now, "PULL следующий (сразу за нажатием)",
+                                             exclude_extra={sel.index} if sel is not None else None,
+                                             immediate=True)
+            if not switched:
+                self.state = State.COMBAT         # клик не встал — остаёмся в бою с текущей, попробуем ещё
+        return switched
+
+    def _pull_none_left(self, now: float) -> bool:
+        """Таблица прочитана (строки есть), а взять из неё некого — не мигание, а правда пусто."""
+        tl = getattr(self, "_list_last", None)
+        return bool(tl is not None and getattr(tl, "visible", False) and tl.rows
+                    and tl.nearest(self._list_exclude(now)) is None)
+
+    def _pull_exit_combat(self, now: float) -> None:
+        """Выход из боя без вердикта "убита" и без Tab (Tab выбрал бы другого моба). Одно место для
+        всех выходов пула — раньше три копии одних и тех же строк расходились."""
+        self.state = State.SEARCH
+        self._cancel_queue(now)
+        self.input_manager.clear_aim_target()
+        self._target_lost_since = None
+        self._reset_search_state(now)
+
+    def _pull_leave_combat(self, now: float, why: str, leash: bool = False) -> None:
+        """Выход из боя (моб жив и бежит за нами) — и домой."""
+        self._pull_exit_combat(now)
+        self._pull_go_home(now, why, leash=leash)
+
+    def _pull_go_home(self, now: float, why: str, leash: bool = False) -> None:
+        pl = self._pull
+        pl.start_return(now, leash=leash)
+        gamepad_debug_logger.debug("PULL    домой (%s): тычек %d, до дома %.0f м", why, pl.tags,
+                                   self.navigator.dist_home_m())
+        self._start_home_trip(now)                # тот же поход, что у обычного "домой" (бег с Shift)
+        self._home_trip_deadline = now + pl.t.return_timeout_s
+
+    def _pull_return_tick(self, now: float) -> None:
+        """RETURN: бежим домой. Дошли / не дошли за return_timeout_s -> KILL (бой там, где стоим)."""
+        pl = self._pull
+        if not self._home_trip_active():          # _search_roam сам закрыл поход: дошёл или таймаут
+            tl = getattr(self, "_list_last", None)
+            center = pl.center_return
+            pl.on_home(now, pl.train(tl.rows) if tl is not None and getattr(tl, "visible", False) else None)
+            gamepad_debug_logger.debug("PULL    дома (до дома %.0f м) — %s", self.navigator.dist_home_m(),
+                                       "у центра — жму R" if center else
+                                       "добор: тычек %d из %d, тычу тех, кто рядом с домом" % (pl.tags, pl.t.max_tags)
+                                       if pl.topup else "добиваю прибежавших")
+            return
+        if now - pl.return_t0 > pl.t.return_timeout_s:
+            self._schedule_home(now, "PULL: до дома за %.0f с не дошёл" % pl.t.return_timeout_s)
+            pl.on_home(now)
+            gamepad_debug_logger.debug("PULL    домой не дошёл — бьюсь здесь (до дома %.0f м)", self.navigator.dist_home_m())
+            return
+        if self._search_phase is not SearchPhase.ROAM:
+            self._enter_roam(now, "PULL домой", home=True)
+        self._search_roam(now)
+
+    def _pull_aoe_prefer(self) -> "set[str] | None":
+        """Пул, добивание: рядом aoe_min_mobs+ мобов -> клавиши по площади вперёд ротации. Иначе None."""
+        pl = getattr(self, "_pull", None)
+        if pl is None or pl.phase != PULL_KILL:
+            return None
+        tl = getattr(self, "_list_last", None)
+        n = pl.aoe_now(tl.rows) if tl is not None and getattr(tl, "visible", False) else 0
+        now = time.monotonic()
+        on = n >= pl.t.aoe_min_mobs
+        if on:
+            self._pull_aoe_low_since = None
+        elif getattr(self, "_pull_aoe_on", False):
+            # Выключаем не сразу: моб на миг выходит из 8 м / строка мигнула (лог: вкл/выкл каждую
+            # секунду) — 1 с подряд "мало" и только тогда обычный порядок.
+            since = getattr(self, "_pull_aoe_low_since", None)
+            if since is None:
+                self._pull_aoe_low_since = since = now
+            if now - since < self._PULL_AOE_OFF_S:
+                on = True
+        if on != getattr(self, "_pull_aoe_on", False):
+            self._pull_aoe_on = on
+            gamepad_debug_logger.debug("PULL    %s", "рядом %d моб(а) — скиллы по площади (%s) первыми" % (
+                n, ", ".join(pl.t.aoe_keys)) if on else "рядом меньше %d мобов — обычный порядок скиллов" % pl.t.aoe_min_mobs)
+        return set(pl.t.aoe_keys) if on else None
+
+    def _pull_note_kill(self) -> None:
+        """Где умер моб: оценка сверху = бот от дома + моб от бота (последние метры цели в списке)."""
+        pl = getattr(self, "_pull", None)
+        if pl is None:
+            return
+        home = self.navigator.dist_home_m()
+        mob = getattr(self, "_combat_last_dist", None) or 0
+        inside = pl.on_kill(home + mob)
+        gamepad_debug_logger.debug("PULL    убит (%s): бот в %.0f м от дома, моб в %d м от бота -> до %.0f м от дома — %s",
+                                   pl.phase, home, mob, home + mob, "в зоне лута" if inside else "ВНЕ зоны лута")
+
+    # --- Проверка зрения при старте (src/core/vision_check.py, 2026-10-12) ---
+    # Чужой монитор (HDR, "Ночной свет", цифровая интенсивность) -> бот не видит список/миникарту/
+    # панель. Провал: строка VCHECK с подсказкой, скриншот в vision_check\, подсказка в интерфейс
+    # (app_launcher.get_status -> vision_warnings).
+    _VCHECK_DIR = "vision_check"     # рядом с программой (exe: рабочая папка = папка exe)
+    _VCHECK_KEEP = 6                 # хранить последних скриншотов — папка не растёт
+
+    def _vision_check_start(self) -> None:
+        """Новый "Старт" — проверка с нуля (бот переживает Старт/Стоп, проверка — нет)."""
+        vc = self._vcheck = VisionCheck()
+        self.vision_warnings = []
+        self._vcheck_ok_logged = False
+        if not self._LIST_TARGETING:
+            vc.skip(VCHECK_LIST)
+        if getattr(self, "navigator", None) is None or getattr(self.vision, "get_minimap", None) is None:
+            vc.skip(VCHECK_MAP)
+        gamepad_debug_logger.debug("VCHECK  старт: экран %sx%s — жду список целей и миникарту до %.0f с, "
+                                   "панель цели — при первых выборах цели",
+                                   getattr(self.vision, "screen_w", "?"), getattr(self.vision, "screen_h", "?"),
+                                   vc.START_WINDOW_S)
+
+    def _vision_check_tick(self) -> None:
+        """Раз в тик: пока всё не видно — пара сравнений флагов; всё видно — сразу выход (early return)."""
+        vc = getattr(self, "_vcheck", None)
+        if vc is None or vc.all_ok:
+            return
+        odo = getattr(getattr(self, "navigator", None), "odo", None)
+        events = vc.tick(time.monotonic(), bool(getattr(self, "_list_ever_seen", False)),
+                         getattr(self, "_list_reads", 0), bool(getattr(odo, "ok", False)))
+        self._vision_check_report(events)
+
+    def _vision_check_report(self, events: "list[tuple[str, str]]") -> None:
+        """Лог + скриншот провала + подсказки в интерфейс. Без событий — только "всё видно" один раз."""
+        vc = self._vcheck
+        for kind, key in events:
+            if kind == "fail":
+                gamepad_debug_logger.debug("VCHECK  НЕ ВИДНО: %s. %s", VCHECK_TITLES[key], VCHECK_HINTS[key])
+                self._vision_check_shot(key)
+            else:
+                gamepad_debug_logger.debug("VCHECK  %s теперь видно — поправка помогла", VCHECK_TITLES[key])
+        if events:
+            self.vision_warnings = vc.warnings()
+            gamepad_debug_logger.debug("VCHECK  итог: %s", vc.summary())
+        if vc.all_ok and not self._vcheck_ok_logged:
+            self._vcheck_ok_logged = True
+            gamepad_debug_logger.debug("VCHECK  всё видно: %s | масштаб списка %.0f%%, гамма панели %.1f",
+                                       vc.summary(), getattr(self.vision, "list_scale", 1.0) * 100,
+                                       getattr(self.vision, "_panel_gamma", 1.0))
+
+    def _vision_check_shot(self, key: str) -> None:
+        """
+        Скриншот всего экрана при провале — по нему видно, что не так (цвета, HDR, второй монитор).
+        Захват — здесь (DXGI: копия готового кадра ~3 мс; без DXGI mss ~20-30 мс — один раз на
+        провал, не в каждом тике). Запись PNG (~100-200 мс для 1440p) — в отдельном потоке,
+        иначе тик бота замер бы на это время.
+        """
+        cap, mon = getattr(self.vision, "_capture", None), getattr(self.vision, "_monitor", None)
+        if cap is None or mon is None:
+            return
+        frame = cap(mon)
+        if frame is None:
+            return
+        path = os.path.abspath(os.path.join(self._VCHECK_DIR, "%s_%s.png" % (time.strftime("%H%M%S"), key)))
+        threading.Thread(target=_save_vcheck_shot, args=(path, frame, self._VCHECK_KEEP),
+                         name="VCheckShot", daemon=True).start()
+        gamepad_debug_logger.debug("VCHECK  скриншот: %s", path)
+
     # --- Навигация и прогулка (src/core/navigation.py) ---
 
     def _nav_tick(self) -> None:
@@ -2832,6 +4435,15 @@ class FarmBot:
         frame = fn()
         yaw_fn = getattr(self.input_manager, "camera_yaw_counts", None)
         nav.update(frame, now, yaw=yaw_fn() if yaw_fn is not None else None)
+        fix = nav.relocalize_home(now) if hasattr(nav, "relocalize_home") else None
+        if fix is not None:
+            # Лог — только заметные поправки (>= 1 px) и раз в 30 с "всё сходится": иначе сверка
+            # каждые 2 с забивала лог (105 строк за 4 мин) и прятала важное (HOME, бой).
+            big = abs(fix[0]) >= self._RELOC_LOG_MIN_PX or abs(fix[1]) >= self._RELOC_LOG_MIN_PX
+            if big or now >= getattr(self, "_reloc_log_at", 0.0):
+                self._reloc_log_at = now + self._RELOC_LOG_EVERY_S
+                gamepad_debug_logger.debug("NAV     сверка с домом: поправка (%+.1f, %+.1f) px, уверенность %.2f — %s",
+                                           fix[0], fix[1], fix[2], nav.summary())
         mv = getattr(self, "movement", None)
         if mv is not None and getattr(mv, "moving_since", None) is not None:
             # Жмём WASD — по сдвигу карты уточняем, куда смотрит камера (нужно камере в подходе).
@@ -2859,15 +4471,52 @@ class FarmBot:
         return (self._ROAM_ENABLED and nav is not None and mv is not None and nav.available(now)
                 and self._list_drives())
 
-    def _enter_roam(self, now: float, why: str) -> None:
+    def _enter_roam(self, now: float, why: str, home: bool = False) -> None:
         nav = self.navigator
         self.input_manager.stop_scan()
         self.input_manager.stop_sweep()
         self.input_manager.clear_aim_target()
-        wp = nav.pick_waypoint()
+        wp = nav.go_home() if home else nav.pick_waypoint()
         self._set_phase(SearchPhase.ROAM, now, why)
-        gamepad_debug_logger.debug("ROAM    прогулка: точка (%.0f, %.0f), до неё %.0f м | %s",
-                                   wp[0], wp[1], nav.dist_waypoint_m(), nav.summary())
+        gamepad_debug_logger.debug("ROAM    %s: точка (%.0f, %.0f), до неё %.0f м | %s",
+                                   "домой" if home else "прогулка", wp[0], wp[1], nav.dist_waypoint_m(), nav.summary())
+
+    def _home_trip_active(self) -> bool:
+        return getattr(self, "_home_trip_deadline", None) is not None
+
+    def _home_due(self, now: float) -> bool:
+        """Пора домой: идёт поход (после боя продолжаем) или подошло время по расписанию."""
+        if not self._HOME_ENABLED or getattr(self, "_pull", None) is not None:
+            return False                          # в режиме пул домой водит PullPlanner (_pull_*)
+        nav = getattr(self, "navigator", None)
+        if nav is None or getattr(self, "movement", None) is None or not nav.available(now):
+            return False
+        if self._home_trip_active():
+            return True
+        if nav.dist_home_m() > self._HOME_LEASH_M:
+            if not getattr(self, "_leash_logged", False):
+                self._leash_logged = True
+                gamepad_debug_logger.debug("HOME    ушёл от дома на %.0f м (> %.0f м) — домой, не дожидаясь таймера",
+                                           nav.dist_home_m(), self._HOME_LEASH_M)
+            return True
+        self._leash_logged = False
+        if now < getattr(self, "_next_home_at", float("inf")):
+            return False
+        if nav.dist_home_m() <= self._HOME_ARRIVE_M:
+            self._schedule_home(now, "уже дома")
+            return False
+        return True
+
+    def _schedule_home(self, now: float, why: str) -> None:
+        self._home_trip_deadline = None
+        self._next_home_at = now + random.uniform(*self._HOME_EVERY_S)
+        gamepad_debug_logger.debug("HOME    %s — следующий возврат домой через %.0f с", why, self._next_home_at - now)
+
+    def _start_home_trip(self, now: float) -> None:
+        if not self._home_trip_active():
+            self._home_trip_deadline = now + self._HOME_TIMEOUT_S
+            gamepad_debug_logger.debug("HOME    пора домой: до дома %.0f м", self.navigator.dist_home_m())
+        self._enter_roam(now, "возврат домой", home=True)
 
     def _search_roam(self, now: float) -> None:
         """
@@ -2877,20 +4526,39 @@ class FarmBot:
         берём сразу.
         """
         nav, mv = self.navigator, self.movement
-        if not self._roam_ready(now):
+        home = self._home_trip_active()
+        if home:
+            # Поход домой: новых целей не берём (напавшего — бой начнётся сам, по панели),
+            # дошли — обычный фарм, якорь прогулки — дом.
+            if nav.dist_home_m() <= (getattr(self, "_home_arrive_now_m", None) or self._HOME_ARRIVE_M):
+                nav.anchor = nav.home
+                self._home_arrive_now_m = None
+                self._schedule_home(now, "дошёл до дома")
+                self._set_phase(SearchPhase.TAB, now, "дома — дальше обычный фарм")
+                return
+            if now > self._home_trip_deadline:
+                self._home_arrive_now_m = None
+                self._schedule_home(now, "до дома за %.0f с не дошёл — бросаю" % self._HOME_TIMEOUT_S)
+                self._set_phase(SearchPhase.TAB, now, "поход домой отменён")
+                return
+            if nav.available(now) is False:
+                return
+            nav.waypoint = nav.home
+        elif not self._roam_ready(now):
             self._set_phase(SearchPhase.TAB, now, "прогулка невозможна: нет одометра/списка/движения")
             return
-        if self._try_list_target(now, "прогулка"):
+        elif self._try_list_target(now, "прогулка"):
             return
         if nav.is_stuck(now, mv.moving_since, mv.body_delta(nav.t.stuck_window_s, now), turning=mv.turn_active):
             mv.unstuck()
             deg = random.uniform(70.0, 150.0) * random.choice((-1.0, 1.0))
             mv.request_turn(nav.turn_counts(deg))
-            nav.pick_waypoint()
+            if not home:
+                nav.pick_waypoint()
             gamepad_debug_logger.debug("STUCK   застрял (карта не двигается) — назад, вбок с прыжком, поворот %+.0f°", deg)
             return
         heading = nav.estimate_heading(now, mv.body_delta(nav.t.heading_window_s, now), turning=mv.turn_active)
-        if nav.arrived():
+        if nav.arrived() and not home:
             wp = nav.pick_waypoint()
             gamepad_debug_logger.debug("ROAM    дошёл — новая точка (%.0f, %.0f), %.0f м", wp[0], wp[1], nav.dist_waypoint_m())
         if heading is None or mv.turn_active:
@@ -3015,7 +4683,8 @@ class FarmBot:
         if col is not None and pres is not None and pres.ok and pres.text is not None:
             col.offer(pres.text, pres.hp_percent, frame, pres.bar)
 
-    def _bb_event(self, now: float, name: str, extra: "dict | None" = None) -> None:
+    def _bb_event(self, now: float, name: str, extra: "dict | None" = None,
+                  images: "dict | None" = None) -> None:
         """Сохранить инцидент в чёрный ящик вместе с состоянием FSM; без ящика — ничего."""
         bb = self._blackbox
         if bb is None:
@@ -3031,10 +4700,12 @@ class FarmBot:
         }
         if extra:
             info.update(extra)
+        imgs = {k: v for k, v in (images or {}).items() if hasattr(v, "copy") and getattr(v, "ndim", 0) >= 2}
         folder = bb.event(
             now, name, info,
             panel_frame=getattr(self.vision, "last_panel_frame", None),
             world_frame=getattr(self.vision, "last_world_frame", None),
+            **({"images": imgs} if imgs else {}),
         )
         if folder:
             gamepad_debug_logger.debug("BBOX    событие '%s' сохранено: %s", name, os.path.basename(folder))
@@ -3070,6 +4741,47 @@ class FarmBot:
         self._last_aim_info = aim_info
         self._last_panel_info = panel_info
         self._bb_observe(now, panel_info)
+        if self._pull_combat_tick(now, panel_info):
+            return
+
+        # ТРУП ПОД ВЫБОРОМ (лог 2026-10-06 05:09:58-05:10:03): моб умер, а панель с HP 0% ещё висит —
+        # вердикт "убита" ждал пропажи панели, бот жал скиллы по трупу, игра от скилла сама брала
+        # другого моба (№4 в 27 м), и начиналась чехарда RELOCK/SWITCH/повторов F+E на 3 с. Пустая
+        # полоска после почти пустой — смерть: считаем панель пропавшей, дальше обычный путь
+        # (грейс 0.15 с -> вердикт -> F+E по следующей строке списка).
+        # Когда текст HP менялся последний раз — признак "моб ещё жив, его бьют" (см. _corpse_panel).
+        if panel_info.found and getattr(panel_info, "hp_text", None) is not None:
+            prev_t = getattr(self, "_corpse_txt", None)
+            if prev_t is None or hp_text.diff_px(prev_t, panel_info.hp_text) >= self._ENGAGE_TEXT_MIN_PX:
+                self._corpse_txt = panel_info.hp_text
+                self._corpse_txt_at = now
+        if panel_info.found and self._corpse_panel(panel_info.hp_percent, now):
+            self._record_hp(now, panel_info.hp_percent)
+            if self._target_lost_since is None:
+                gamepad_debug_logger.debug("PANEL   HP цели 0%% (было %.1f%%) — моб мёртв, панель ещё висит: "
+                                           "считаю пропавшей", self._hp_hist[-1][1] if self._hp_hist else -1)
+            panel_info = dataclasses.replace(panel_info, found=False)
+
+        # ЧУЖОЙ МОБ (blackbox 2026-10-09 21:37): полоска HP на панели СЕРАЯ — этого моба бьёт другой
+        # игрок (под панелью "цель цели" — его ник). Раньше серую полоску читали как HP 0% и считали
+        # моба мёртвым: бот бросал живого моба с 70%. Теперь HP читается верно, а моба — уступаем:
+        # держится серой _FOREIGN_CONFIRM_S -> строку в чёрный список, берём своего из списка.
+        # ИГРОК под выбором (светлая полоска, blackbox 22:01 — "Shinka"): не наша цель вообще —
+        # строку в чёрный список надолго, берём моба.
+        is_player = panel_info.found and getattr(panel_info, "player", False)
+        if is_player or (panel_info.found and getattr(panel_info, "foreign", False)):
+            fs = getattr(self, "_foreign_since", None)
+            if fs is None:
+                self._foreign_since = now
+            elif now - fs >= self._FOREIGN_CONFIRM_S:
+                self._foreign_since = None
+                why = ("под выбором ИГРОК, а не моб" if is_player else
+                       "чужой моб: серая полоска HP %.0f%% (его бьёт другой игрок)" % panel_info.hp_percent)
+                if self._try_list_switch(now, why=why, blacklist=True,
+                                         blacklist_s=self._PLAYER_BLACKLIST_S if is_player else None):
+                    return
+        else:
+            self._foreign_since = None
 
         if not panel_info.found:
             # ПЕРВЫЙ кадр без панели — ещё не факт смерти. Панель куда
@@ -3087,7 +4799,10 @@ class FarmBot:
                 # очереди жала скиллы дальше — игра наводила их на моба под прицелом, и бот
                 # ввязывался в бой с чужим мобом, который потом бросал. Панели нет — новые
                 # скиллы не жмём: цепочка замораживается и доиграется, если панель вернётся.
-                self._cancel_queue(now)
+                # "Железное добивание" (лог 23:01:12): если моб был далеко не при смерти, пропажа
+                # панели — скорее вспышка/эффект, чем смерть: очередь скиллов НЕ сбрасываем.
+                if not self._finish_guard():
+                    self._cancel_queue(now)
             self._refresh_list(now)
             grace_s = self._lost_grace_s()
             if now - self._target_lost_since < grace_s:
@@ -3118,10 +4833,18 @@ class FarmBot:
                     )
                 return
             if killed:
-                logger.info("COMBAT -> SEARCH: цель пропала (убита), лут автоматический.")
-                if getattr(self, "navigator", None) is not None:
+                ses = getattr(self, "_session", None)
+                if ses is not None:
+                    ses["kills"] += 1
+                    ses["kill_t"].append(now)
+                logger.info("COMBAT -> SEARCH: цель пропала (убита), лут автоматический. Убито за сессию: %d.",
+                            ses["kills"] if ses is not None else 0)
+                if getattr(self, "navigator", None) is not None and getattr(self, "_pull", None) is None:
                     self.navigator.set_anchor()   # мобы спавнятся тут — прогулка (если понадобится) вокруг этого места
+                    # (в режиме пул якорь — всегда дом: сбор не должен "уползать" за убийствами)
             else:
+                if getattr(self, "_session", None) is not None:
+                    self._session["lost"] += 1
                 logger.info(
                     "COMBAT -> SEARCH: цель ПОТЕРЯНА, не убита (HP было %.0f%%, прогноз %.0f%%) — ищу её же.",
                     last_hp, projected,
@@ -3166,14 +4889,45 @@ class FarmBot:
             # кандидатов с координатами уже мёртвой цели, вместо того
             # чтобы честно взять самого широкого заново.
             self.vision.reset_tracking()
+            self._world_cache = None              # полоски мёртвой цели больше не нужны камере
+            self._world_valid_from = now          # и фоновый замер, снятый до смерти, — тоже
             self._target_lost_since = None
             # Новый поиск — с чистого листа: фаза TAB, счётчики, таймеры.
             self._reset_search_state(now)
             if killed:
+                # Дом — ПЕРВЫМ (guard clause, 2026-10-12): раньше проверка "пора домой" жила только в
+                # фазе TAB, а быстрый выбор следующей цели ниже уводил бота в бой, минуя TAB, — при
+                # плотных мобах домой не шёл никогда (лог 00:31-00:35: ушёл на 82 м при поводке 40 м,
+                # ни одной строки HOME). Убийство — момент, когда бот точно свободен: решаем тут.
+                # Напавший по дороге — бой начнётся сам (панель), после него поход продолжится.
+                # Песочница: home_due_test.py — методы дома берутся из bot.py через ast, навигатор-
+                # заглушка с dist_home_m()=82 -> _home_due True и поход ROAM, игра не нужна.
+                self._pull_note_kill()
+                if self._home_due(now):
+                    self._start_home_trip(now)
+                    return
+                # Следующая цель — СРАЗУ, в этом же тике (просьба 2026-10-05 "следующая цель
+                # заранее"): список прочитан на этом тике (чтение выше), ближняя строка уже
+                # известна — F+E уходят без фазы выбора и без лишних тиков (раньше 2-3 тика
+                # по 75 мс + реакция). Не вышло (списка нет/пусто) — обычный путь ниже.
+                # Панель пропала, но "убита" ли — список знает лучше: убитый моб к вердикту
+                # (0.4 с) из списка уже исчез (лог 21:49:13, 21:49:26), а живой, с которого
+                # игра сняла выбор при обновлении таблицы, — на месте, на тех же метрах.
+                # prefer_dist: такая строка есть -> жмём её (добиваем того же), нет -> ближняя.
+                if self._PREPICK_ENABLED and self._list_drives() and self._try_list_target(
+                        now, "сразу после убийства", immediate=True,
+                        prefer_dist=getattr(self, "_combat_last_dist", None)):
+                    return
                 # Небольшая случайная пауза перед первым Tab — см. комментарий
                 # к _POST_KILL_DELAY: мгновенная реакция здесь неестественна.
                 self._next_action_at = now + random.uniform(*self._POST_KILL_DELAY)
             else:
+                # Цель сбросилась (список обновился/игра сняла выбор), а моб жив: со списком —
+                # сразу F+E по нему же (строка с теми же метрами), без медленного поиска Tab-ом.
+                last_d = getattr(self, "_combat_last_dist", None)
+                if self._PREPICK_ENABLED and self._list_drives() and last_d is not None and self._try_list_target(
+                        now, "цель сбросилась — беру её же", immediate=True, prefer_dist=last_d):
+                    return
                 self._begin_reacquire(now, last_hp, projected)
             return
 
@@ -3185,6 +4939,10 @@ class FarmBot:
         lost_since = self._target_lost_since
         self._target_lost_since = None
         self._lost_hold_logged = False
+        if lost_since is not None and now - lost_since >= 0.15:
+            # Замер морганий панели: по этим строкам подбирается грейс (_TARGET_LOST_GRACE_S).
+            gamepad_debug_logger.debug("BLINK   панель цели вернулась через %.2f с (грейс %.2f с)",
+                                       now - lost_since, self._lost_grace_s())
         if (
             lost_since is not None
             and self._SWAP_DETECT_ENABLED
@@ -3209,7 +4967,9 @@ class FarmBot:
                     "hp_after": panel_info.hp_percent,
                 })
             else:
-                self._lock_new_target(now, "панель пропадала %.2fс и вернулась" % (now - lost_since))
+                self._lock_new_target(now, "панель пропадала %.2fс и вернулась" % (now - lost_since),
+                                      old_hp=self._hp_hist[-1][1] if self._hp_hist else None,
+                                      new_hp=panel_info.hp_percent)
                 return
 
         # Копим историю HP для строгой проверки убийства (см. _kill_verdict).
@@ -3248,6 +5008,10 @@ class FarmBot:
         if self._list_drives():
             self._tick_relock_click(now)
             self._tick_reengage(now)
+            self._tick_arrival(now)               # до повтора E: дошли до дистанции удара — это не "стоим"
+            self._tick_attack_retry(now)
+            if self.state is State.COMBAT and self._tick_finish_wounded(now):
+                return
             self._list_camera(now, aim_info)
             if getattr(self, "_list_saw_selected", False) and self.state is State.COMBAT:
                 self._list_progress(now)
@@ -3267,12 +5031,54 @@ class FarmBot:
         # панели бросало живого моба — главная причина "бот не добивает".
         hist = self._hp_hist
         low_hp = bool(hist) and 0.0 <= hist[-1][1] <= self._FAST_KILL_MAX_HP
+        # Полоска уже ПУСТАЯ (0%) и до этого была на дне — моб мёртв: живой моб с 0% не бывает.
+        # Ждать мигание панели (0.42 с) тут незачем — это и была пауза после каждого убийства
+        # (лог 03:53-04:02: все 30+ вердиктов "последнее HP 0.0%" ждали по 0.42-0.45 с).
+        if (len(hist) >= 2 and 0.0 <= hist[-1][1] <= self._DEAD_HP_MAX and 0.0 <= hist[-2][1] <= self._DEAD_PREV_HP_MAX
+                and getattr(self, "_hp_seen_alive", True)):
+            return self._DEAD_GRACE_S
         tl = getattr(self, "_list_last", None) if self._LIST_TARGETING else None
         if tl is not None and tl.visible and tl.selected_row is not None and getattr(self, "_list_saw_selected", False):
             return self._FAST_KILL_GRACE_S if low_hp else self._LIST_ALIVE_GRACE_S
         if low_hp:
             return self._FAST_KILL_GRACE_S
+        if self._finish_guard():
+            return self._FINISH_GRACE_S
         return self._TARGET_LOST_GRACE_S
+
+    # Железное добивание (2026-10-05): панель пропала, а последнее HP цели >= этого — ждём её
+    # возвращения _FINISH_GRACE_S (а не 0.45 с) и не сбрасываем скиллы: так бот бросал мобов
+    # с 11-37% HP, когда экран заливала красная вспышка (лог 23:01:12, 23:07:28).
+    _FINISH_HP_MIN = 20.0
+    _FINISH_GRACE_S = 1.0
+
+    def _finish_guard(self) -> bool:
+        hist = getattr(self, "_hp_hist", None)
+        return bool(hist) and hist[-1][1] >= self._FINISH_HP_MIN
+
+    # Труп или моб с 0.3-4% HP? Полоска у обоих читается 0% (blackbox 2026-10-09 22:23-23:21: бот
+    # объявлял "убит" мобам с 37, 67, 157, 160, 229, 543 из 13 957 HP — заливка в 1-5 px у края
+    # полоски бледная и не распознаётся). Отличаем по ТЕКСТУ HP: у живого, которого бьём, число
+    # меняется с каждым ударом, у трупа "0/13 957" стоит. И по списку: у выбранной строки есть HP.
+    _CORPSE_TEXT_STILL_S = 1.0        # текст HP не менялся столько — моб не получает урона = труп
+    _CORPSE_LIST_ALIVE_HP = 0.015     # у выбранной строки списка HP выше — моб жив
+
+    def _corpse_panel(self, hp: float, now: "float | None" = None) -> bool:
+        """Панель есть, но полоска пустая, а прошлый замер HP уже был у дна — цель мертва."""
+        hist = self._hp_hist
+        if not (0.0 <= hp <= self._DEAD_HP_MAX and bool(hist)
+                and 0.0 <= hist[-1][1] <= self._DEAD_PREV_HP_MAX
+                and getattr(self, "_hp_seen_alive", True)):     # 0% с самого начала — это 1-2%, а не труп
+            return False
+        now = time.monotonic() if now is None else now
+        if getattr(self, "_corpse_txt", None) is not None and \
+                now - getattr(self, "_corpse_txt_at", now) < self._CORPSE_TEXT_STILL_S:
+            return False                  # число HP только что менялось — моб жив, добиваем
+        tl = getattr(self, "_list_last", None)
+        sel = tl.selected_row if (tl is not None and tl.visible) else None
+        if sel is not None and sel.hp is not None and sel.hp > self._CORPSE_LIST_ALIVE_HP:
+            return False                  # в списке у нашей строки ещё есть HP
+        return True
 
     def _record_hp(self, now: float, hp: float) -> None:
         """
@@ -3280,6 +5086,8 @@ class FarmBot:
         окно. Не каждый кадр: 60 записей в секунду ничего не добавили бы к
         оценке скорости падения, а окно на 3 с хранит ровно 30 чисел.
         """
+        if hp >= self._ALIVE_SEEN_HP:
+            self._hp_seen_alive = True
         if now >= self._hp_next_sample_at:
             self._hp_hist.append((now, hp))
             self._hp_next_sample_at = now + self._KILL_HP_SAMPLE_EVERY_S
@@ -3376,9 +5184,57 @@ class FarmBot:
             )
             return
 
-        self._lock_new_target(now, "hp %.0f%% -> %.0f%%" % (ref_hp, new_hp))
+        self._lock_new_target(now, "hp %.0f%% -> %.0f%%" % (ref_hp, new_hp), old_hp=ref_hp, new_hp=new_hp)
 
-    def _lock_new_target(self, now: float, why: str) -> None:
+    # Возврат к раненой цели (2026-10-11, "бот не добивает"): игра сама переключила выбор на свежего моба,
+    # а наш, уже битый, жив и стоит в списке — возвращаемся и добиваем, а не бежим за новым.
+    _SWAPBACK_OLD_MAX = 95.0      # наша цель была ранена (HP % не выше)
+    _SWAPBACK_GAIN = 15.0         # новая цель здоровее хотя бы на столько п.п. — значит, это другой моб
+    _SWAPBACK_TOL_M = 6           # строка нашей цели — в стольких метрах от последних прочитанных
+    _SWAPBACK_COOLDOWN_S = 4.0    # не чаще: если игра упорно выбирает другого, не устраиваем пинг-понг
+
+    def _try_swap_back(self, now: float, old_hp: "float | None", new_hp: "float | None") -> bool:
+        """
+        True — нашли нашу раненую цель в списке и выбираем её снова (ушли в SEARCH/LIST, F+E).
+        Узнаём её так: строка рядом с последними метрами нашей цели и с неполной полоской HP
+        (полоска не прочиталась — хватает метров). Строки нет (моб умер — строка исчезает) — False,
+        дальше как раньше: бьём ту, что выбрала игра.
+        Проверить без игры: заглушка _refresh_list со строками [№1 4 м 5%, №2 22 м выбрана] и
+        _engaged=True -> _try_swap_back(t, 5.0, 100.0) выбирает №1; без строки №1 (моб умер) -> False.
+        """
+        if (old_hp is None or new_hp is None or not self._engaged or not self._list_drives()
+                or old_hp > self._SWAPBACK_OLD_MAX or new_hp < old_hp + self._SWAPBACK_GAIN
+                or now < getattr(self, "_swapback_next_at", 0.0)):
+            return False
+        old_d = getattr(self, "_combat_last_dist", None)
+        tl = self._refresh_list(now, force=True)
+        if old_d is None or tl is None or not tl.visible:
+            return False
+        sel = tl.selected_row                      # её выбрала игра — не она
+        exclude = self._list_exclude(now) | ({sel.index} if sel is not None else set())
+        cands = [r for r in tl.rows if r.index not in exclude and not r.faded and r.distance_m is not None
+                 and abs(r.distance_m - old_d) <= self._SWAPBACK_TOL_M
+                 and (r.hp is None or 0.03 < r.hp < 0.97)]
+        if not cands:
+            return False
+        # Сначала строки с прочитанной неполной полоской (это точно битый моб), потом ближе к прошлым метрам.
+        row = min(cands, key=lambda r: (r.hp is None, abs(r.distance_m - old_d)))
+        self._swapback_next_at = now + self._SWAPBACK_COOLDOWN_S
+        gamepad_debug_logger.debug(
+            "BACK    игра сменила цель на свежую (HP %.0f%%), а наша была %.0f%% и жива: №%d (%d м%s) — возвращаюсь, добиваю",
+            new_hp, old_hp, row.index, row.distance_m, "" if row.hp is None else ", %.0f%%" % (row.hp * 100))
+        self._bb_event(now, "swap_back", {"old_hp": old_hp, "new_hp": new_hp, "old_dist": old_d,
+                                          "row": row.index, "list": format_list(tl)})
+        self.state = State.SEARCH
+        self._cancel_queue(now)
+        self._target_lost_since = None
+        self._reset_search_state(now)
+        self._next_action_at = now
+        return self._try_list_target(now, "возврат к раненой цели", exclude_extra={sel.index} if sel else None,
+                                     immediate=True, prefer_dist=row.distance_m)
+
+    def _lock_new_target(self, now: float, why: str, old_hp: "float | None" = None,
+                         new_hp: "float | None" = None) -> None:
         """
         Игра дала другую цель, не выпуская нас из COMBAT: повторяем вход в бой
         так же, как _enter_combat — "захват -> удар", и только потом скиллы.
@@ -3387,6 +5243,8 @@ class FarmBot:
         рассчитаны на СТАРУЮ цель; пусть лучше пропадут, чем отработают без
         захвата. Исполняемое сейчас не трогаем (оборвать нажатие грубее).
         """
+        if self._try_swap_back(now, old_hp, new_hp):
+            return                                # вернулись к своей раненой — новую игнорируем
         self._cancel_queue(now)
         self._swap_samples.clear()
         self._swap_next_sample_at = now
@@ -3398,6 +5256,9 @@ class FarmBot:
         # История HP относилась к СТАРОМУ мобу: для проверки убийства нового
         # она бы только исказила скорость падения.
         self._hp_hist.clear()
+        self._engage_first = None                 # пул: "первая запись" новой цели (см. _pull_combat_tick)
+        self._hp_seen_alive = False           # новая цель: её живое HP ещё не видели
+        self._corpse_txt = None               # и текст HP — с чистого листа
         self._hp_next_sample_at = now
         self._target_locked = False     # до первого удара (ПКМ) скиллы заперты
         if self._USE_WORLD_VISION:
@@ -3422,6 +5283,7 @@ class FarmBot:
         self._lp_best = None                      # прогресс подхода — заново, от этого моба
         self._lp_in_melee = False
         self._lp_faded_since = None
+        self._dmg_real_at = None                   # новый моб: стрейфы — после урона по нему
         self._target_locked = True                # Ctrl+ЛКМ / ПКМ по прицелу не нужны: цель уже выбрана
         tl = getattr(self, "_list_last", None)
         sel = tl.selected_row if tl is not None and tl.visible else None
@@ -3435,13 +5297,40 @@ class FarmBot:
         gamepad_debug_logger.debug("RELOCK  игра выбрала моба рядом (%s) — он уже в бою с нами, добиваю", why)
         self._open_gate(now, "цель выбрана игрой, моб рядом")
 
+    # Метры цели не прочитались ("2:?*", рамка выбора мигнула) — берём последние прочитанные, если
+    # им не больше столько секунд и цель та же (лог 2026-10-06 04:41-04:46: на "?" метры считались
+    # неизвестными, и скиллы уходили в цель за 19-39 м — обрывали бег к ней).
+    _DIST_HOLD_S = 1.0
+
     def _target_dist_m(self) -> "int | None":
         """Расстояние до НАШЕЙ цели по списку (выбранная строка) или None — строки нет/не прочли."""
         if not self._LIST_TARGETING:
             return None
         tl = getattr(self, "_list_last", None)
         sel = tl.selected_row if tl is not None and tl.visible else None
-        return sel.distance_m if sel is not None else None
+        d = sel.distance_m if sel is not None else None
+        now = time.monotonic()
+        ref = getattr(self, "_last_select_at", None)
+        if d is not None:
+            self._dist_mem = (d, now, ref)
+            return d
+        mem = getattr(self, "_dist_mem", None)
+        if mem is not None and mem[2] == ref and now - mem[1] <= self._DIST_HOLD_S:
+            return mem[0]
+        return None
+
+    def _hitting_since_select(self) -> bool:
+        """
+        Автоатака бьёт: бой открыт и после ПОСЛЕДНЕГО выбора цели (F+E / клик по строке, в т.ч.
+        "подбеги" REENGAGE) по ней прошёл настоящий урон (HP упало). Метры не важны — так и
+        дальнобойный персонаж стрейфит, пока бьёт с 20+ м. Чистая функция от двух отметок времени.
+        """
+        if not getattr(self, "_engaged", False):
+            return False
+        dmg = getattr(self, "_dmg_real_at", None)
+        if dmg is None:
+            return False
+        return dmg >= getattr(self, "_last_select_at", float("-inf"))
 
     def _reengage_click(self, now: float, why: str) -> bool:
         """
@@ -3458,10 +5347,7 @@ class FarmBot:
         if not self.input_manager.is_idle():
             self._cancel_queue(now)               # скиллы всё равно не долетают — не ждём конца цепочки
             return False
-        jx, jy = self._LIST_JITTER_PX
-        px, py = sel.click_point
-        self._list_click(*self.vision.list_point_to_screen(
-            (px + random.uniform(-jx, jx), py + random.uniform(-jy, jy))))
+        self._list_select(sel)
         self._reengage_next_at = now + self._REENGAGE_COOLDOWN_S
         self._reengage_since = None
         self._lp_in_melee = False
@@ -3489,6 +5375,140 @@ class FarmBot:
             return                                # урон идёт (дальнобойные скиллы достают) — не мешаем
         self._reengage_click(now, "моб в %d м, урона нет" % d)
 
+    def _tick_attack_retry(self, now: float) -> None:
+        """
+        COMBAT до первого урона: персонаж должен бежать к цели (E). Метры выбранной строки
+        падают — всё хорошо, ждём. Не падают или строки в списке не видно дольше
+        _ATTACK_RETRY_S после последнего E -> E ещё раз (цель на панели та же, F не нужен).
+        После _ATTACK_RETRY_MAX повторов подряд без сдвига — смена цели через список.
+        Как проверить без игры: list_stable_test.py, сценарий S7 (E "съедена" -> повтор).
+        """
+        if getattr(self, "_engaged", False) or self.state is not State.COMBAT:
+            self._atk_retries = 0
+            return
+        last = getattr(self, "_last_select_at", None)
+        if last is None:
+            return
+        tl = getattr(self, "_list_last", None)
+        sel = tl.selected_row if tl is not None and tl.visible else None
+        d = sel.distance_m if sel is not None else None
+        best = getattr(self, "_atk_best_d", None)
+        if getattr(self, "_atk_ref_select", None) != last:
+            # Новый выбор (F+E, подбеги, повтор) — отсчёт заново от него.
+            self._atk_ref_select = last
+            self._atk_best_d = d
+            self._atk_best_t = now
+            self._atk_due = now + random.uniform(*self._attack_retry_window(d))
+            self._atk_retries = 0
+            return
+        if d is not None and (best is None or d <= best - self._ATTACK_PROGRESS_M):
+            dt = max(0.05, now - getattr(self, "_atk_best_t", now))
+            fast = best is None or (best - d) / dt >= self._ATTACK_RUN_MIN_MPS
+            self._atk_best_d = d
+            self._atk_best_t = now
+            if fast:                              # бежим к цели — повтор не нужен
+                self._atk_due = now + random.uniform(*self._attack_retry_window(d))
+                self._atk_retries = 0
+                return
+            # Метры ползут (моб идёт к нам сам) — это не бег: таймер повтора E не сбрасываем.
+        if now < getattr(self, "_atk_due", float("inf")) or not self.input_manager.is_idle():
+            return
+        n = getattr(self, "_atk_retries", 0)
+        if n >= self._ATTACK_RETRY_MAX:
+            self._atk_retries = 0
+            gamepad_debug_logger.debug("ATTACK  %d повторов E — персонаж так и не побежал/не бьёт: другая цель", n)
+            if not self._try_list_switch(now, why="E не срабатывает"):
+                self._atk_due = now + random.uniform(*self._ATTACK_RETRY_S)
+            return
+        fn = getattr(type(self.input_manager), "attack_key", None)
+        if not callable(fn):
+            return                                # ввод без attack_key (заглушки старых тестов) — не умеем
+        gamepad_debug_logger.debug("ATTACK  урона нет, к цели не бежим (%s) — жму %s ещё раз (%d/%d)",
+                                   "строки цели в списке нет" if d is None else "%d м, не уменьшается" % d,
+                                   self._TARGET_ATTACK_KEY.upper(), n + 1, self._ATTACK_RETRY_MAX)
+        self.input_manager.attack_key(self._TARGET_ATTACK_KEY)
+        self._last_select_at = time.monotonic()   # новый E: стрейфы ждут урона, отсчёт повтора заново
+        self._atk_ref_select = self._last_select_at   # это НАШ повтор — счётчик повторов не сбрасываем
+        self._atk_retries = n + 1
+        self._atk_best_d = d
+        self._atk_due = now + random.uniform(*self._attack_retry_window(d))
+
+    def _attack_retry_window(self, d: "int | None") -> "tuple[float, float]":
+        """Через сколько без сдвига метров жать E снова: быстро, если цель точно дальше удара."""
+        rng = self._attack_range_m()
+        if d is not None and d > (rng + 1 if rng is not None else self._ATTACK_FAR_DEFAULT_M):
+            return self._ATTACK_RETRY_FAST_S
+        return self._ATTACK_RETRY_S               # у дистанции удара: возможно, это замах — не сбиваем
+
+    # Дистанция применения скиллов (просьба 2026-10-06: "дистанция скилла не равна дистанции удара,
+    # ставим 15 м"). Задана — ротация открывается, как только цель ближе неё (не ждём автоатаку),
+    # и по ней же решается "стоим зря — жми E снова". None — учить по первому удару, как раньше.
+    _SKILL_RANGE_M: "int | None" = 15
+
+    def _attack_range_m(self) -> "int | None":
+        """
+        Выученная дистанция удара персонажа, м, или None — мало данных. Медиана ВЕРХНЕЙ половины
+        замеров: первый удар бывает и ближе дистанции (моб сам бежит на нас — лог 21:49:11,
+        "первый удар с 3 м"), но не дальше неё; простая медиана [3, 15] дала бы 3.
+        """
+        if self._SKILL_RANGE_M is not None:
+            return int(self._SKILL_RANGE_M)
+        hist = getattr(self, "_arrive_hist", None)
+        if not hist or len(hist) < self._ARRIVE_MIN_SAMPLES:
+            return None
+        top = sorted(hist)[len(hist) // 2:]
+        return int(statistics.median_high(top))
+
+    def _tick_arrival(self, now: float) -> None:
+        """
+        COMBAT, цель из списка: (1) учит дистанцию удара — метры строки цели в момент первого
+        настоящего урона после выбора (если до него пробежали >= _ARRIVE_RAN_MIN_M: значит,
+        остановились именно потому, что "достаём"); (2) пока ротация закрыта, а метры цели уже
+        <= выученной дистанции — открывает её (см. _ARRIVE_*).
+        Как проверить без игры: list_stable_test.py, сценарий AR (фейковый список: метры
+        падают 30 -> 15, на 15 HP падает; второй бой — ротация открывается на 15 м до урона).
+        """
+        last = getattr(self, "_last_select_at", None)
+        if last is None or self.state is not State.COMBAT:
+            return
+        tl = getattr(self, "_list_last", None)
+        sel = tl.selected_row if tl is not None and tl.visible else None
+        d = sel.distance_m if sel is not None else None
+        if d is not None:
+            self._combat_last_dist = d            # метры нашей цели — узнать её строку после сброса/смерти
+        if getattr(self, "_arr_ref", None) != last:
+            self._arr_ref = last                  # новый выбор (F+E, подбеги, повтор E) — замер заново
+            self._arr_start_d = d
+            self._arr_min_d = d
+            self._arr_sampled = False
+        elif d is not None:
+            if self._arr_start_d is None:
+                self._arr_start_d = d
+            if self._arr_min_d is None or d < self._arr_min_d:
+                self._arr_min_d = d
+        if not self._arr_sampled and self._hitting_since_select():
+            self._arr_sampled = True
+            start, low = self._arr_start_d, self._arr_min_d
+            if start is not None and low is not None and start - low >= self._ARRIVE_RAN_MIN_M:
+                hist = self.__dict__.setdefault("_arrive_hist", deque(maxlen=7))
+                hist.append(low)
+                gamepad_debug_logger.debug("RANGE   первый удар с %d м (бежали от %d м) — дистанция удара ~%s м",
+                                           low, start, self._attack_range_m() or "?")
+        if not self._ARRIVE_GATE_ENABLED or not self._ENGAGE_GATE_ENABLED or getattr(self, "_engaged", False):
+            return
+        rng = self._attack_range_m()
+        if rng is None or d is None or d > rng or now - last < self._ARRIVE_AFTER_SELECT_S:
+            return
+        if now < getattr(self, "_eg_settle_until", 0.0) or getattr(self, "_swap_since", None) is not None:
+            return
+        # Сторож урона сравнивает с числом HP ДО боя: удар, который уже прошёл, тоже засчитается.
+        self._eg_dmg_base = getattr(self, "_eg_base", None)
+        self._eg_dmg_base_hp = getattr(self, "_eg_base_hp", 0.0)
+        self._eg_dmg_change_since = None
+        self._eg_last_dmg_at = now
+        self._eg_retabs = 0
+        self._open_gate(now, "цель в %d м — дистанция удара (~%d м), бью, не дожидаясь замаха" % (d, rng))
+
     def _tick_relock_click(self, now: float) -> None:
         """Отложенный клик по строке цели, которую выбрала игра (см. _relock_from_list)."""
         at = getattr(self, "_relock_click_at", None)
@@ -3500,13 +5520,409 @@ class FarmBot:
         if sel is None:
             self._open_gate(now, "цель выбрана игрой, в списке её уже нет — она рядом")
             return
-        jx, jy = self._LIST_JITTER_PX
-        px, py = sel.click_point
-        self._list_click(*self.vision.list_point_to_screen(
-            (px + random.uniform(-jx, jx), py + random.uniform(-jy, jy))))
+        cand = self._closer_row(tl, sel, now)
+        if cand is not None:
+            # Игра взяла далёкого моба, а рядом есть ближе — бежим к ближнему (просьба 2026-10-05).
+            gamepad_debug_logger.debug("CLOSER  игра выбрала №%d (%d м), а №%d в %d м — беру ближнюю",
+                                       sel.index, sel.distance_m, cand.index, cand.distance_m)
+            self._closer_next_at = now + self._CLOSER_COOLDOWN_S
+            if self._try_list_switch(now, why="игра выбрала дальнюю", blacklist=False):
+                return
+        self._list_select(sel)
         self._list_saw_selected = True
         self._lp_best = None
         self._list_cam_search_started = now
+
+    # Скиллы "по своему КД" вставляются в очередь ввода ПЕРВЫМИ (InputManager.execute_combo_now).
+    _OWN_WEAVE_ENABLED = True
+
+    def _weave_supported(self) -> bool:
+        return self._OWN_WEAVE_ENABLED and callable(getattr(type(self.input_manager), "execute_combo_now", None))
+
+    def _weave_own_cd(self, now: float) -> bool:
+        """
+        Скилл "по своему КД" готов -> сразу в начало очереди ввода: нажмётся следующим, сразу
+        после того, что жмётся сейчас, и без своего замка (просьба 2026-10-05 "максимально
+        убери микропаузы при нажатии постоянных скилов"). Раньше он ждал конца идущей цепочки
+        (лог 21:49:02: "'Цепочка #2' готова, но идёт '1' (2.4 с из 3.7) — жду") и сам вешал
+        замок ~0.9 с на все остальные. Идущая цепочка не рвётся — она просто доиграет позже на
+        время вставки (min_end сдвигаем), её скиллы и заморозка при смерти цели не путаются.
+        Пауза ПОСЛЕ самого скилла — прежняя (анимация в игре: короче неё нажатие "съедается").
+        Не нажатая до смерти цели вставка (очередь сброшена) -> скилл снова "готов".
+        Как проверить без игры: speed_gate_test.py, блок WV.
+        """
+        if not self._weave_supported():
+            return False
+        ready = None
+        for c in self._chains:
+            if not c.get("independent"):
+                continue
+            # Таймер — от НАСТОЯЩЕГО нажатия (см. _own_cd_confirmed), панель только придерживает:
+            # таймер вышел, а слот ещё на откате -> ждём, когда станет готов.
+            if now >= c["next_ready_at"] and self._own_cd_panel_state(c, now) is not False:
+                ready = c
+                break
+        if ready is None:
+            return False
+        ready["_ready_since"] = None
+        ready["_last_fire"] = now
+        steps = list(zip(ready["gamepad_steps"], ready["cast_times"]))
+        tagged = self._input_tracks_chains()
+        self._own_seq = getattr(self, "_own_seq", 0) + 1
+        tags = [("own", self._own_seq, i) for i in range(len(steps))]
+        # В начало очереди — в обратном порядке: каждый следующий встаёт перед предыдущим.
+        for (combo, cast_time_s), tag in reversed(list(zip(steps, tags))):
+            if tagged:
+                self.input_manager.execute_combo_now(combo, cast_time_s=cast_time_s, tag=tag)
+            else:
+                self.input_manager.execute_combo_now(combo, cast_time_s=cast_time_s)
+        est = self._chain_min_duration({"gamepad_steps": [st[0] for st in steps],
+                                        "cast_times": [st[1] for st in steps]})
+        inflight = self._chain_inflight
+        if inflight is not None:
+            inflight["min_end"] += est
+        self._weave_until = max(getattr(self, "_weave_until", 0.0), now) + est
+        cooldown_s = random.uniform(ready["cooldown_min"], ready["cooldown_max"])
+        ready["next_ready_at"] = now + cooldown_s
+        weaves = [w for w in self.__dict__.setdefault("_own_weaves", [])
+                  if w[0] is not None and not self.input_manager.combo_done(w[0])] if tagged else []
+        weaves.append((tags[-1] if tagged else None, ready))
+        self._own_weaves = weaves
+        self._autoattack_engaged = False
+        gamepad_debug_logger.debug(
+            "WEAVE   '%s' (%s) — по своему КД, вне очереди: сразу за текущим нажатием%s; следующий через %.1f с",
+            ready["name"], ready["sequence"],
+            " (цепочка '%s' продолжится после)" % inflight["name"] if inflight is not None else "", cooldown_s)
+        return True
+
+    # --- Ротация по приоритетам (2026-10-10, src/core/rotation.py) ---
+    _ROTATION_MODE = "priority"          # "chains" — прежняя ротация цепочками
+
+    def _priority_on(self) -> bool:
+        return self._ROTATION_MODE == "priority" and bool(getattr(self, "_chains", None))
+
+    def _prio_hold_priority(self) -> None:
+        """Важные скиллы (PRIORITY_KEYS) — на "откат" до _prio_start_hold_until (начало сессии)."""
+        until = getattr(self, "_prio_start_hold_until", None)
+        if until is None or until <= time.monotonic():
+            return
+        rot = self._prio_obj
+        moved = rot.delay_keys(rot.priority, until)
+        if moved:
+            gamepad_debug_logger.debug("PRIO    после Старта важные (%s) не жму ещё %.0f с",
+                                       ", ".join(moved), until - time.monotonic())
+
+    def _prio(self) -> PriorityRotation:
+        """Список приоритетов из текущих цепочек; цепочки перечитали (Старт/живая перезагрузка) — пересобираем."""
+        ch = self._chains
+        if getattr(self, "_prio_obj", None) is None or getattr(self, "_prio_src", None) is not ch:
+            old = getattr(self, "_prio_obj", None)
+            self._prio_obj = PriorityRotation.from_chains(ch)
+            self._prio_src = ch
+            if old is not None:                       # таймеры КД переживают перечитку конфига
+                prev = {a.action_name: a for a in old.actions}
+                for a in self._prio_obj.actions:
+                    p = prev.get(a.action_name)
+                    if p is not None:
+                        a.last_fire, a.next_by_timer = p.last_fire, p.next_by_timer
+            else:
+                self._prio_hold_priority()           # первая сборка — придержать важные после "Старт"
+            # Готовность проверяет сама ротация перед нажатием — перенос в конец очереди в потоке
+            # ввода не нужен (в очереди всегда одно действие).
+            if hasattr(self.input_manager, "skill_ready_fn"):
+                self.input_manager.skill_ready_fn = None
+            gamepad_debug_logger.debug("PRIO    ротация по КД (* — Постоянно, в скобках КД): %s",
+                                       self._prio_obj.describe())
+            for msg in self._prio_obj.conflicts:      # один скилл в разных цепочках с разными настройками
+                gamepad_debug_logger.debug("PRIO    ВНИМАНИЕ: %s", msg)
+                logger.warning("Ротация: %s", msg)
+        return self._prio_obj
+
+    # Костыль (2026-10-11, просьба: "6 жалась без таргета, даже когда бот бежит к мобу"): эти клавиши
+    # жмутся по своему КД ВСЕГДА — в поиске, на подходе, без цели. В бою их и так жмёт ротация.
+    # Только скиллы из "Постоянно" (по своему КД): берём их готовность и таймер из той же ротации,
+    # поэтому двойного нажатия (поиск + бой) не будет. Пусто () — костыль выключен.
+    _ALWAYS_KEYS = ("6",)
+
+    def _always_keys_tick(self) -> None:
+        """Вне боя: скилл из _ALWAYS_KEYS готов (панель/таймер) и ввод свободен — жмём."""
+        if not self._ALWAYS_KEYS or self.state is State.COMBAT or not getattr(self, "_running", False):
+            return
+        if not self._priority_on() or not self.input_manager.is_idle():
+            return
+        now = time.monotonic()
+        pr = self._prio()
+        for a in pr.actions:
+            if not a.own_cd or a.action_name[6:] not in self._ALWAYS_KEYS:
+                continue
+            why = pr._action_ok(a, now, self._prio_ready)
+            if why is None:
+                continue
+            for i in range(a.repeat):
+                self.input_manager.execute_combo(list(a.combo), cast_time_s=a.cast_s if i == a.repeat - 1 else None)
+            pr.fired(a, now)
+            gamepad_debug_logger.debug("PRIO    жму %s (из '%s', готов по %s, вне боя: %s)",
+                                       a.label, a.source, why, self.state.name)
+            return
+
+    def _prio_ready(self, action: str) -> "bool | None":
+        fn = getattr(getattr(self, "_skill_check", None), "ready", None)
+        return fn(action) if fn is not None else None
+
+    def _priority_tick(self, now: float, own_only: bool = False) -> bool:
+        """
+        Ввод свободен -> первое готовое действие из списка приоритетов. True — нажали (или ввод
+        ещё занят прошлым действием / его кастом — ждём); False — готового нет (можно автоатаку).
+        """
+        pl = getattr(self, "_pull", None)
+        if pl is not None and pl.phase == PULL_RETURN:
+            # Пул: по дороге домой — только "Постоянно (по своему КД)" ("6"): скилл оборвал бы бег.
+            # На сборе (2026-10-14, от игрока: "верни скиллы, когда пулит") — обычная ротация по цели:
+            # удар скиллом = тычка быстрее. Скиллы по площади (3, 4, =) по-прежнему бережём для кучи
+            # у дома — их отсекает avoid (PullPlanner.aoe_keys_now).
+            own_only = True
+        if not self.input_manager.is_idle():
+            return True                               # прошлое действие или его каст ещё идут
+        pr = self._prio()
+        pl = getattr(self, "_pull", None)
+        pick = pr.choose(now, self._prio_ready, own_only=own_only, prefer=self._pull_aoe_prefer(),
+                         avoid=pl.aoe_keys_now() if pl is not None else None)
+        if pick is WAIT:
+            # Идёт приоритетная цепочка, её следующий шаг ещё откатывается (ждём до 1.5 с, потом
+            # пропуск) — ничего другого не жмём, иначе порядок связки разорвётся.
+            return True
+        if pick is None:
+            self._log_prio_skips(now, pr)
+            # Жать нечего — раз в 2 с пишем почему (яркость слота сейчас / эталон "готов"):
+            # по этим строкам видно, если бот считает скилл "на откате", а он на деле готов.
+            if not own_only and now >= getattr(self, "_prio_idle_log_at", 0.0):
+                self._prio_idle_log_at = now + 2.0
+                det = getattr(getattr(self, "_skill_check", None), "ready_detail", None)
+                gamepad_debug_logger.debug("PRIO    жать нечего: %s", pr.blocked_report(now, self._prio_ready, det))
+            return False
+        a, why = pick
+        self._log_prio_skips(now, pr)
+        # n — сколько ударов СЕЙЧАС: многоударный скилл, который целиком не влезает до отката "6",
+        # жмётся частью, остальные удары ротация отдаст сразу после "6" (rotation.PENDING_S).
+        n = pr.hits(a)
+        for i in range(n):
+            self.input_manager.execute_combo(list(a.combo), cast_time_s=a.cast_s if i == n - 1 else None)
+        pr.fired(a, now)
+        self._autoattack_engaged = False
+        gamepad_debug_logger.debug("PRIO    жму %s%s (из '%s', готов по %s%s)", a.label,
+                                   "" if n == a.repeat else " — %d уд." % n, a.source, why,
+                                   ", каст %.1f с" % a.cast_s if a.cast_s else "")
+        return True
+
+    def _log_prio_skips(self, now: float, pr) -> None:
+        """Готовые, но не взятые сейчас скиллы и почему — не чаще раза в секунду (по ним видно,
+        остались ли "готов, а не нажал"). Строка: PRIO    пропущен готовый: 5(зажать) — ...)."""
+        skips = getattr(pr, "skips", None)
+        if not skips or now < getattr(self, "_prio_skip_log_at", 0.0):
+            return
+        self._prio_skip_log_at = now + 1.0
+        gamepad_debug_logger.debug("PRIO    пропущен готовый: %s", "; ".join("%s — %s" % s for s in skips))
+
+    def _own_cd_confirmed(self, slot_label: str, t_press: float) -> None:
+        """
+        Проверка нажатий подтвердила: скилл slot_label сработал в t_press. Скиллу "по своему КД"
+        следующий раз — ровно через его КД от ЭТОГО нажатия, кто бы его ни сделал (цепочка,
+        повтор, вставка). Лог 2026-10-10 00:44: панельная "готовность" без этой привязки жала "6"
+        каждые ~1.3 с (эталон яркости был выучен по тёмному слоту) — 40 нажатий, 9 сработали.
+        """
+        sc = getattr(self, "_skill_check", None)
+        slot_of = getattr(sc, "_slot_of", {}) if sc is not None else {}
+        if getattr(self, "_prio_obj", None) is not None:
+            for key, label in slot_of.items():
+                if label == slot_label:
+                    self._prio_obj.confirmed("press_%s" % key, t_press)
+        for c in getattr(self, "_chains", []):
+            steps = c.get("gamepad_steps") or []
+            if not c.get("independent") or len(steps) != 1 or len(steps[0]) != 1:
+                continue
+            act = steps[0][0]
+            key = act[6:] if act.startswith("press_") else act
+            if slot_of.get(key, key) == slot_label:
+                c["next_ready_at"] = t_press + random.uniform(c["cooldown_min"], c["cooldown_max"])
+
+    # Скилл "по своему КД" — по ПАНЕЛИ, а не по таймеру (2026-10-10, жалоба "скилл 6 с КД 6 с
+    # иногда жмётся раз в 10-12 с"). Лог 23:40-23:42: таймер 5.4-6.6 с шёл сам по себе, а "6" жала
+    # ещё и 'Цепочка #4' — таймер срабатывал, когда слот был на откате (4 раза из 17), нажатие
+    # пропадало, и следующее ждало ещё 6 с. Теперь: слот на панели готов -> через реакцию человека
+    # (0.05-0.25 с) жмём. Кто бы ни нажал скилл перед этим — неважно, смотрим на сам слот.
+    # Панель не читается (None) — по таймеру, как раньше.
+    _OWN_READY_REACT_S = (0.05, 0.25)
+    _OWN_REFIRE_GUARD_S = 1.2            # после нажатия слот темнеет не мгновенно — не жмём дважды
+
+    def _own_cd_panel_state(self, chain: dict, now: float) -> "bool | None":
+        steps = chain.get("gamepad_steps") or []
+        if len(steps) != 1 or len(steps[0]) != 1:
+            return None                       # цепочка из нескольких скиллов — по таймеру
+        sc = getattr(self, "_skill_check", None)
+        fn = getattr(sc, "ready", None)
+        if fn is None:
+            return None
+        try:
+            r = fn(steps[0][0])
+        except Exception:
+            return None
+        if r is None:
+            return None
+        pending = any(w[1] is chain and w[0] is not None and not self.input_manager.combo_done(w[0])
+                      for w in getattr(self, "_own_weaves", []))
+        if not r or pending or now - chain.get("_last_fire", float("-inf")) < self._OWN_REFIRE_GUARD_S:
+            chain["_ready_since"] = None
+            return False
+        if chain.get("_ready_since") is None:
+            chain["_ready_since"] = now
+            chain["_ready_react"] = random.uniform(*self._OWN_READY_REACT_S)
+        return now - chain["_ready_since"] >= chain.get("_ready_react", 0.0)
+
+    def _restore_unpressed_weaves(self, now: float) -> None:
+        """Очередь сбрасывается: вставки "по своему КД", которые не успели нажаться, — снова готовы."""
+        weaves = getattr(self, "_own_weaves", None)
+        if not weaves:
+            return
+        for tag, chain in weaves:
+            if tag is not None and not self.input_manager.combo_done(tag):
+                chain["next_ready_at"] = min(chain["next_ready_at"], now)
+        self._own_weaves = []
+        self._weave_until = 0.0
+
+    # Скилл "по своему КД" и без цели (просьба 2026-10-05: "чтобы скилл, который жмётся постоянно,
+    # жался даже без таргета"): в поиске, когда кликнуть в списке некого (прогулка, осмотр).
+    _OWN_CD_NO_TARGET = True
+    _OWN_CD_IDLE_PHASES = ("TAB", "SCAN", "ROAM")
+
+    def _tick_own_cd_idle(self, now: float, panel_info) -> None:
+        """
+        SEARCH без цели: готовый скилл "по своему КД" — сразу (вне очереди, см. _weave_own_cd).
+        НЕ жмём, если в списке есть кого выбрать: скилл встал бы в очередь перед F+E и задержал
+        выбор на свою анимацию (~0.8 с) — и не жмём в выборе/подходе (лог 22:47: скилл сразу после
+        F+E отменял бег к цели). Панель с целью видна — это уже не "без цели".
+        Как проверить без игры: weave_test.py, блок NT.
+        """
+        if not self._OWN_CD_NO_TARGET or self.state is not State.SEARCH or panel_info.found:
+            return
+        pl = getattr(self, "_pull", None)
+        if pl is not None and pl.eagle_pending:
+            return                                # камера внизу под R — "6" задержал бы R на свою анимацию
+        phase = getattr(self, "_search_phase", None)
+        if phase is None or phase.name not in self._OWN_CD_IDLE_PHASES:
+            return
+        if self._LIST_TARGETING and self._list_has_target(now):
+            return
+        if self._weave_own_cd(now):
+            gamepad_debug_logger.debug("OWNCD   без цели (фаза %s, в списке некого) — жму по своему КД", phase.name)
+
+    def _cast_chain(self, now: float, chain: dict) -> None:
+        """Каст одной цепочки ротации: очередь скиллов, свой кулдаун, пауза "не спамь поверх анимации"."""
+        logger.info(
+            "COMBAT: кастую цепочку '%s' (%d скилл(ов): %s).",
+            chain["name"], len(chain["gamepad_steps"]), chain["sequence"],
+        )
+        # cast_times — параллельный gamepad_steps список (та же
+        # длина и порядок, см. skills_config.py) с реальным временем
+        # каста каждого шага или None, если у шага нет кастомного
+        # времени (тогда execute_combo сам возьмёт обычную короткую
+        # межскилльную паузу). zip(), а не индекс по range(len()) —
+        # идиома Python для "иду по двум спискам синхронно
+        # попарно", читается как сама мысль "шаг + его время каста",
+        # без риска рассинхронизировать индексы вручную.
+        # Замок: с этого момента цепочка "в полёте" (min_end — нижняя оценка конца).
+        # Каждый скилл — с меткой: при смерти цели посреди цепочки ненажатые
+        # доиграем на следующей (_freeze_inflight_chain / _resume_frozen_chain).
+        self._start_chain_steps(now, chain["name"],
+                                list(zip(chain["gamepad_steps"], chain["cast_times"])))
+
+        # Кулдаун — диапазон, разыгрываем КОНКРЕТНОЕ значение один
+        # раз здесь и запоминаем как абсолютный дедлайн (тот же
+        # приём, что и у _next_action_at ниже) — а не перегенерируем
+        # случайное число на каждой проверке готовности, что дало бы
+        # "мерцающий" кулдаун вместо стабильного значения на цикл.
+        cooldown_s = random.uniform(
+            chain["cooldown_min"], chain["cooldown_max"]
+        )
+        chain["next_ready_at"] = now + cooldown_s
+        # Каст скилла прерывает текущую автоатаку персонажа — после
+        # цепочки автоатаку придётся запускать заново одним свежим
+        # нажатием RB, а не полагаться на то, что она сама
+        # продолжится после чужого действия поверх неё.
+        self._autoattack_engaged = False
+        # ВАЖНО (источник путаницы при чтении лога вручную):
+        # каждая цепочка считает СВОЙ кулдаун от СВОЕГО собственного
+        # предыдущего каста — независимо от других цепочек. Если
+        # цепочка 2 откастовалась между двумя кастами цепочки 1,
+        # это НЕ сдвигает и НЕ сбрасывает таймер цепочки 1. Поэтому
+        # "цепочка 1 началась почти сразу после конца цепочки 2"
+        # может быть абсолютно верным поведением — печатаем здесь
+        # явный дедлайн, чтобы это было видно по секундам в логе, а
+        # не приходилось прикидывать на глаз по временным меткам
+        # COMBO START/END.
+        gamepad_debug_logger.debug(
+            "ROTATION: цепочка '%s' кастуется, следующий повтор "
+            "через %.1fс (диапазон %.1f-%.1fс, независимо от других "
+            "цепочек).",
+            chain["name"], cooldown_s,
+            chain["cooldown_min"], chain["cooldown_max"],
+        )
+        # Пауза "не спамь поверх анимации" — НЕ кулдаун цепочки (тот
+        # отдельно лежит в next_ready_at и продолжает тикать
+        # независимо от этой паузы).
+        self._next_action_at = now + random.uniform(*self._SKILL_CAST_DELAY)
+
+    # ВЫКЛ (лог 22:47:52, 22:48:00, 22:48:12): скилл 6, нажатый сразу после F+E, отменял бег к
+    # цели — персонаж стоял на 31-33 м по 1-5 с, пока повтор E не запускал бег заново. Без него в
+    # тех же боях — бег сразу и удар через 1.5 с. "По своему КД" теперь жмётся с момента, когда
+    # ротация открыта: первый урон или дошли до дистанции удара (_tick_arrival).
+    _OWN_CD_BEFORE_ENGAGE = False
+
+    def _cast_own_cd_before_engage(self, now: float) -> bool:
+        """
+        Скилл/цепочка "жать по своему КД" (галочка в шаге или "Пуск: всегда") — и ДО первого
+        урона, пока бежим к цели. Раньше шлагбаум (ротация ждёт первого упавшего HP) держал и
+        их: в логе 2026-10-05 20:43 скилл с КД 6 с жался раз в 10.5-10.9 с — каждый раз ждал,
+        пока персонаж добежит 22-34 м и ударит. Остальная ротация по-прежнему ждёт урона.
+        E после скилла НЕ жмём (лог 21:49): бег скилл не обрывает (метры падали дальше), а
+        лишний E на бегу как раз обрывал его — персонаж вставал в 15-17 м и не бил по 2-6 с.
+        Только в режиме списка (в режиме зрения бег устроен иначе).
+        Как проверить без игры: chain_freeze_test.py, сценарий OWN (КД 6 с, бой не открыт).
+        """
+        if not self._OWN_CD_BEFORE_ENGAGE or not self._list_drives() or self._swap_since is not None:
+            return False
+        if self._priority_on():
+            return self._priority_tick(now, own_only=True)
+        if self._weave_supported():
+            return self._weave_own_cd(now)
+        ready = next((c for c in self._chains if c.get("independent") and now >= c["next_ready_at"]), None)
+        if ready is None or self._chain_busy(now) or not self.input_manager.is_idle():
+            return False
+        gamepad_debug_logger.debug("OWNCD   '%s' — по своему КД, не дожидаясь первого удара (бежим к цели)",
+                                   ready["name"])
+        self._cast_chain(now, ready)
+        return True
+
+    _RANGE_HOLD_SLACK_M = 2        # запас к дальности скиллов: 15 м -> держим скиллы с 18 м (метры списка — целые)
+    _RANGE_HOLD_LOG_EVERY_S = 2.0
+
+    def _out_of_skill_range(self, now: float) -> bool:
+        """
+        True — цель по списку дальше дальности скиллов (+ запас): ротацию держим, очередь
+        скиллов замораживаем (доиграется, когда добежим). Метры неизвестны — не держим.
+        """
+        d = self._target_dist_m()
+        rng = self._attack_range_m()
+        if d is None or rng is None or d <= rng + self._RANGE_HOLD_SLACK_M:
+            return False
+        if getattr(self, "_chain_inflight", None) is not None and not self.input_manager.is_idle():
+            # Скиллы цепочки в очереди оборвали бы бег — замораживаем (доиграются в дальности).
+            # Только при цепочке в полёте: иначе в очереди может стоять сам выбор F+E.
+            self._cancel_queue(now)
+        if now >= getattr(self, "_range_hold_log_at", 0.0):
+            self._range_hold_log_at = now + self._RANGE_HOLD_LOG_EVERY_S
+            gamepad_debug_logger.debug("ROTATION: цель в %d м — дальше дальности скиллов (%d м), не жму: "
+                                       "скилл оборвал бы бег к ней", d, rng)
+        return True
 
     def _act_combat_rotation(self, now: float) -> None:
         """
@@ -3559,6 +5975,8 @@ class FarmBot:
         # ШЛАГБАУМ: пока HP цели ни разу не изменилось после входа в бой, мы
         # не знаем, что бьём моба, а не воздух — ротация ждёт (идёт автоатака).
         if self._ENGAGE_GATE_ENABLED and not self._engaged:
+            if self._cast_own_cd_before_engage(now):
+                return
             if not self._eg_gate_logged:
                 self._eg_gate_logged = True
                 gamepad_debug_logger.debug(
@@ -3572,78 +5990,50 @@ class FarmBot:
         if self._swap_since is not None:
             return
 
-        # ЖЁСТКИЙ ЗАМОК (см. _CHAIN_*): пока идёт предыдущая цепочка (или её
-        # хвостовая пауза) — ни новой цепочки, ни автоатаки. _chain_busy идёт
-        # ПЕРВЫМ: он же фиксирует конец цепочки (CHAIN END).
-        if self._chain_busy(now):
-            self._log_chain_wait(now)
+        # ЦЕЛЬ ДАЛЬШЕ ДАЛЬНОСТИ СКИЛЛОВ (лог 2026-10-06 04:24:47-57, "крутится на месте"): цель
+        # сменилась на моба в 25-33 м, бот жал F+E (персонаж бежит к ней) и через 0.2 с — скилл,
+        # а нажатие скилла ОБРЫВАЕТ автобег. Так по кругу 10 с: ни урона, ни сближения. Пока цель
+        # дальше дальности + запас — скиллы не жмём (и ставленные в очередь замораживаем), даём добежать.
+        if self._out_of_skill_range(now):
             return
 
-        # Остальное, что стоит в очереди (захват, удар, шаг) — тоже ждём.
-        if not self.input_manager.is_idle():
-            return
-
-        # Сначала — скиллы цепочки, замороженной смертью прошлой цели (_CHAIN_FROZEN_MAX_S).
-        if self._resume_frozen_chain(now):
-            self._autoattack_engaged = False
-            return
-
-        for chain in self._chains:
-            if now >= chain["next_ready_at"]:
-                logger.info(
-                    "COMBAT: кастую цепочку '%s' (%d скилл(ов): %s).",
-                    chain["name"], len(chain["gamepad_steps"]), chain["sequence"],
-                )
-                # cast_times — параллельный gamepad_steps список (та же
-                # длина и порядок, см. skills_config.py) с реальным временем
-                # каста каждого шага или None, если у шага нет кастомного
-                # времени (тогда execute_combo сам возьмёт обычную короткую
-                # межскилльную паузу). zip(), а не индекс по range(len()) —
-                # идиома Python для "иду по двум спискам синхронно
-                # попарно", читается как сама мысль "шаг + его время каста",
-                # без риска рассинхронизировать индексы вручную.
-                # Замок: с этого момента цепочка "в полёте" (min_end — нижняя оценка конца).
-                # Каждый скилл — с меткой: при смерти цели посреди цепочки ненажатые
-                # доиграем на следующей (_freeze_inflight_chain / _resume_frozen_chain).
-                self._start_chain_steps(now, chain["name"],
-                                        list(zip(chain["gamepad_steps"], chain["cast_times"])))
-
-                # Кулдаун — диапазон, разыгрываем КОНКРЕТНОЕ значение один
-                # раз здесь и запоминаем как абсолютный дедлайн (тот же
-                # приём, что и у _next_action_at ниже) — а не перегенерируем
-                # случайное число на каждой проверке готовности, что дало бы
-                # "мерцающий" кулдаун вместо стабильного значения на цикл.
-                cooldown_s = random.uniform(
-                    chain["cooldown_min"], chain["cooldown_max"]
-                )
-                chain["next_ready_at"] = now + cooldown_s
-                # Каст скилла прерывает текущую автоатаку персонажа — после
-                # цепочки автоатаку придётся запускать заново одним свежим
-                # нажатием RB, а не полагаться на то, что она сама
-                # продолжится после чужого действия поверх неё.
-                self._autoattack_engaged = False
-                # ВАЖНО (источник путаницы при чтении лога вручную):
-                # каждая цепочка считает СВОЙ кулдаун от СВОЕГО собственного
-                # предыдущего каста — независимо от других цепочек. Если
-                # цепочка 2 откастовалась между двумя кастами цепочки 1,
-                # это НЕ сдвигает и НЕ сбрасывает таймер цепочки 1. Поэтому
-                # "цепочка 1 началась почти сразу после конца цепочки 2"
-                # может быть абсолютно верным поведением — печатаем здесь
-                # явный дедлайн, чтобы это было видно по секундам в логе, а
-                # не приходилось прикидывать на глаз по временным меткам
-                # COMBO START/END.
-                gamepad_debug_logger.debug(
-                    "ROTATION: цепочка '%s' кастуется, следующий повтор "
-                    "через %.1fс (диапазон %.1f-%.1fс, независимо от других "
-                    "цепочек).",
-                    chain["name"], cooldown_s,
-                    chain["cooldown_min"], chain["cooldown_max"],
-                )
-                # Пауза "не спамь поверх анимации" — НЕ кулдаун цепочки (тот
-                # отдельно лежит в next_ready_at и продолжает тикать
-                # независимо от этой паузы).
-                self._next_action_at = now + random.uniform(*self._SKILL_CAST_DELAY)
+        # Ротация по ПРИОРИТЕТАМ (src/core/rotation.py): одно действие за раз, решение — в момент
+        # нажатия. Не готово ничего — ниже автоатака. Старая ротация цепочками — _ROTATION_MODE.
+        if self._priority_on():
+            if self._priority_tick(now):
                 return
+        else:
+            # "По своему КД" — вне очереди цепочек: ни замка, ни ожидания конца чужой цепочки
+            # (см. _weave_own_cd). Ввод без такой возможности (заглушки тестов) — как раньше, ниже.
+            if self._weave_own_cd(now):
+                return
+
+            # ЖЁСТКИЙ ЗАМОК (см. _CHAIN_*): пока идёт предыдущая цепочка (или её
+            # хвостовая пауза) — ни новой цепочки, ни автоатаки. _chain_busy идёт
+            # ПЕРВЫМ: он же фиксирует конец цепочки (CHAIN END).
+            if self._chain_busy(now):
+                self._log_chain_wait(now)
+                return
+
+            # Остальное, что стоит в очереди (захват, удар, шаг) — тоже ждём. Кроме нашей же
+            # вставки "по своему КД": цепочка встанет в очередь сразу за ней, без паузы.
+            if not self.input_manager.is_idle() and now >= getattr(self, "_weave_until", 0.0):
+                return
+
+            # Самые первые — "всегда по своему КД" (шаг с галочкой или "Пуск: Всегда"): раньше
+            # даже доигрывания замороженной цепочки. Иначе (лог 2026-10-05 20:38-20:39) длинная
+            # цепочка, которая не успевает за жизнь моба, доигрывалась на каждом следующем
+            # мобе, и короткая "всегда"-цепочка не получала ни одного окна — не жалась вообще.
+            # Потом — заморозка (_CHAIN_FROZEN_MAX_S), потом обычные цепочки по порядку.
+            ready_own = next((c for c in self._chains if c.get("independent") and now >= c["next_ready_at"]), None)
+            if ready_own is None and self._resume_frozen_chain(now):
+                self._autoattack_engaged = False
+                return
+
+            for chain in ([ready_own] if ready_own is not None else self._chains):
+                if now >= chain["next_ready_at"]:
+                    self._cast_chain(now, chain)
+                    return
 
         # Ни одна цепочка из ротации не готова. РАНЬШЕ здесь на каждой такой
         # проверке (~раз в секунду, по _COMBAT_ATTACK_COOLDOWN) заново жалось
@@ -3654,7 +6044,20 @@ class FarmBot:
         # Поэтому жмём RB ТОЛЬКО если автоатака ещё не запущена
         # (_autoattack_engaged == False) — а не готовую цепочку всё равно
         # продолжаем проверять на каждом тике, просто без лишнего нажатия.
-        if not self._autoattack_engaged:
+        if not self._autoattack_engaged and self._list_drives() and self._rmb_safe():
+            # Под прицелом ТОЛЬКО наша цель (рядом других полосок нет) — ПКМ: это настоящая
+            # автоатака игры (E её не запускает — лог 03:42-03:43: E жмётся, автоатаки нет).
+            gamepad_debug_logger.debug("ROTATION: ни одна цепочка не готова -> автоатака ПКМ (под прицелом только наша цель)")
+            self.input_manager.press_button("attack")
+            self._autoattack_engaged = True
+        elif not self._autoattack_engaged and self._list_drives():
+            # ПКМ сейчас мог бы взять чужого моба (лог 03:29:28), а E автоатаку не запускает
+            # (лог 03:42-03:43). Не жмём ничего: через ~1 с (_COMBAT_ATTACK_COOLDOWN) проверим
+            # снова — камера тем временем доведёт прицел на нашу цель.
+            if now >= getattr(self, "_rmb_wait_log_at", 0.0):
+                self._rmb_wait_log_at = now + 3.0
+                gamepad_debug_logger.debug("ROTATION: автоатака ждёт — под прицелом не только наша цель (ПКМ взял бы чужую)")
+        elif not self._autoattack_engaged:
             if not self._guard_allows(now, "attack_click"):
                 # ПКМ в прицел сейчас мог бы выбрать другого моба — не жмём,
                 # спросим снова через обычный интервал.
@@ -3671,6 +6074,11 @@ class FarmBot:
             self.input_manager.press_button("attack")
             self._autoattack_engaged = True
 
+        if self._priority_on():
+            # Ротация по приоритетам: следующий скилл может стать готов в любой момент — проверяем
+            # часто (проверка дешёвая, автоатака повторно не жмётся: _autoattack_engaged).
+            self._next_action_at = now + random.uniform(0.08, 0.15)
+            return
         self._next_action_at = now + random.uniform(*self._COMBAT_ATTACK_COOLDOWN)
 
     def _log_chain_wait(self, now: float) -> None:
@@ -3937,3 +6345,16 @@ if __name__ == "__main__":
     print("Тест завершён. Смотри лог выше — должна быть видна цепочка "
           "SEARCH -> COMBAT (ПКМ) -> смена цели (RELOCK, новый ПКМ) "
           "-> SEARCH.")
+
+def _save_vcheck_shot(path: str, frame, keep: int) -> None:
+    """Поток-писатель скриншота проверки зрения: PNG без потерь (цвета важны для разбора), потом
+    чистка — в папке остаются `keep` последних файлов. Ошибка записи не должна ронять бота."""
+    try:
+        _imwrite(path, frame)
+        folder = os.path.dirname(path)
+        shots = sorted((f for f in os.listdir(folder) if f.endswith(".png")),
+                       key=lambda f: os.path.getmtime(os.path.join(folder, f)))
+        for f in shots[:-keep]:                  # срез [:-keep] — всё, кроме последних keep
+            os.remove(os.path.join(folder, f))
+    except Exception as e:
+        logger.warning("проверка зрения: скриншот не сохранён: %s", e)

@@ -1,0 +1,12 @@
+{
+ "state": "COMBAT",
+ "phase": "TAB",
+ "engaged": false,
+ "since_entry_s": 0.0,
+ "chain": null,
+ "panel_found": true,
+ "hp": 0.0,
+ "txt": "None",
+ "why": "панель пропадала 0.41с и вернулась",
+ "event": "swap_relock"
+}

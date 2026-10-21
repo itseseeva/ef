@@ -1,0 +1,20 @@
+        self._target_lost_since = None
+        self._lost_hold_logged = False
+        if lost_since is not None and now - lost_since >= 0.15:
+            # Замер морганий панели: по этим строкам подбирается грейс (_TARGET_LOST_GRACE_S).
+            gamepad_debug_logger.debug("BLINK   панель цели вернулась через %.2f с (грейс %.2f с)",
+                                       now - lost_since, self._lost_grace_s())
+        if (
+            lost_since is not None
+            and self._SWAP_DETECT_ENABLED
+            and now - lost_since >= self._RELOCK_GAP_S
+        ):
+            # ОХРАННИК: HP не выросло (с допуском на шум полоски) -> это ТА ЖЕ цель,
+            # просто панель моргнула; захват и ПКМ по прицелу не трогаем (в толпе
+            # они могли бы выбрать другого моба). Выросло -> игра дала другого.
+            same_target = (
+                self._GUARD_ENABLED
+                and self._engaged
+                and bool(self._hp_hist)
+                and panel_info.hp_percent <= self._hp_hist[-1][1] + self._CONTINUITY_TOL_PCT
+            )

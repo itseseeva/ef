@@ -1,0 +1,17 @@
+68: def _fail(reason: str) -> PanelResult:
+69: return PanelResult(ok=False, reason=reason)
+192: return _fail("нет кадра")
+204: return _fail("нет чёрных линий рамки")
+243: return _fail(last_reason)
+259: return _fail("у линий нет общего участка")
+264: return _fail("длина линий %d px вне диапазона" % span)
+266: return _fail("линии рамки с большими разрывами")
+268: return _fail("вторая линия рамки закрыта больше чем на %d%%" % round((1 - other_cover_min) * 100))
+278: return _fail("нет правой границы рамки")
+290: return _fail("окантовка рамки вне ROI")
+294: return _fail("нет бежевой окантовки сверху")
+300: return _fail("нет бежевой окантовки снизу")
+315: return _fail("нет малиновой плашки кнопки X")
+318: return _fail("нет крестика на кнопке X")
+320: return _fail("нет бежевой окантовки снизу")    # низ закрыт, а кнопку X не проверить — не рискуем
+330: ok=True, reason="ok", hp_percent=hp,

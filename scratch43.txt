@@ -1,0 +1,30 @@
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+    mask = (
+        cv2.inRange(hsv, _YELLOW[0], _YELLOW[1])
+        | cv2.inRange(hsv, _RED_1[0], _RED_1[1])
+        | cv2.inRange(hsv, _RED_2[0], _RED_2[1])
+    )
+    return np.count_nonzero(mask, axis=0) >= T.FILL_MIN_ROWS
+
+
+def _hp_from_fill(flags: np.ndarray) -> float:
+    """
+    HP% по колонкам заливки. Заливка растёт слева направо, поэтому берём
+    ПЕРВУЮ непрерывную полосу (разрывы <= FILL_MAX_GAP — текст "1 647/1 647"
+    и насечка не считаются концом) и её длину делим на полную ширину.
+    Ничего правее первого большого разрыва не учитываем: это уже не
+    заливка, а шум (блик, чужой жёлтый пиксель в пустой части полоски).
+    """
+    idx = np.flatnonzero(flags)
+    if idx.size == 0 or idx[0] > T.FILL_MAX_GAP:
+        return 0.0
+    end = int(idx[0])
+    for i in idx[1:]:
+        if i - end - 1 > T.FILL_MAX_GAP:
+            break
+        end = int(i)
+    return min(100.0, round((end + 1) / flags.size * 100.0, 2))
+
+
+def read_panel(frame: np.ndarray) -> PanelResult:
+    """

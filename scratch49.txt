@@ -1,0 +1,20 @@
+    # Полоса из BEIGE_ROWS строк над верхней линией и под нижней. Окантовка
+    # полупрозрачная, поэтому требуем не "каждую строку", а "в каждом столбце хоть
+    # одна строка бежевая" (см. _beige_band_fraction): иначе на тёмном фоне панель
+    # выбранного моба не узнавалась вовсе и бот не входил в бой (лог 2026-10-03
+    # 12:29, 15 раз подряд "нет бежевой окантовки снизу"). Защиту от ложных панелей
+    # держат остальные проверки: две чёрные линии ровно в 11 px, правая граница и
+    # малиновая кнопка X с крестиком.
+    xa, xb = x_left + 2, x_right - 1
+    if yt - 1 < 0 or yb + 1 >= h:
+        return _fail("окантовка рамки вне ROI")
+    top = frame[max(0, yt - T.BEIGE_ROWS):yt, xa:xb]
+    bottom = frame[yb + 1:min(h, yb + 1 + T.BEIGE_ROWS), xa:xb]
+    if _beige_band_fraction(top) < T.BEIGE_FRACTION_MIN:
+        return _fail("нет бежевой окантовки сверху")
+    bottom_frac = _beige_band_fraction(bottom)
+    # Низ частично закрыт строкой "цель цели" (имя другого игрока) — допускаем, но тогда
+    # кнопка X обязана найтись (см. BEIGE_BOTTOM_FRACTION_MIN).
+    weak_bottom = bottom_frac < T.BEIGE_FRACTION_MIN
+    if bottom_frac < getattr(T, "BEIGE_BOTTOM_FRACTION_MIN", T.BEIGE_FRACTION_MIN):
+        return _fail("нет бежевой окантовки снизу")

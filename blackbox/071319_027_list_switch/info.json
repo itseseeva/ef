@@ -1,0 +1,14 @@
+{
+ "state": "COMBAT",
+ "phase": "TAB",
+ "engaged": false,
+ "since_entry_s": 0.03,
+ "chain": null,
+ "panel_found": true,
+ "hp": 100.0,
+ "txt": "HpText(sig=aa7b76c0, ink=188, 10x98)",
+ "waited_s": 0.03100000019185245,
+ "why": "игра выбрала дальнюю",
+ "list": "1:12м!(66%) 2:6м 3:24м* 4:25м 5:32м!",
+ "event": "list_switch"
+}

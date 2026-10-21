@@ -1,0 +1,14 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": true,
+ "since_entry_s": 2.05,
+ "chain": null,
+ "panel_found": true,
+ "hp": 70.5,
+ "txt": "HpText(sig=c37d74a6, ink=219, 10x98)",
+ "waited_s": 2.0469999997876585,
+ "why": "PULL цель №1 ушла за зону (26 м от бота, до дома 17 м) — бросаю",
+ "list": "1:26м*(74%) 2:7мX 3:14м!(91%) 4:13м! 5:13м 6:27м",
+ "event": "list_switch"
+}

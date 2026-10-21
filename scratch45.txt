@@ -1,0 +1,3 @@
+ok: False
+hp: 0.0
+reason: окантовка рамки вне ROI

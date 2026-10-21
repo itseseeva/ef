@@ -1,0 +1,361 @@
+{
+  "_README": "Конфигурация клавиатурных комбинаций и цепочек ротации для Throne and Liberty.",
+  "exportDate": "2026-10-11T21:15:45.770Z",
+  "mode": "keyboard",
+  "totalChains": 4,
+  "chains": [
+    {
+      "id": "chain_1791220856185",
+      "name": "Постоянно",
+      "order": 1,
+      "triggerAfter": "always",
+      "cooldownSeconds": 5,
+      "stepsCount": 12,
+      "steps": [
+        {
+          "stepIndex": 1,
+          "key": "1",
+          "slot": "1",
+          "combo": "1",
+          "skillName": "Key_1",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 5,
+          "cooldown": 5,
+          "independent": false
+        },
+        {
+          "stepIndex": 2,
+          "key": "2",
+          "slot": "2",
+          "combo": "2",
+          "skillName": "Key_2",
+          "castTimeSeconds": 0,
+          "repeatCount": 3,
+          "actionType": "press",
+          "skillCooldownSeconds": 12,
+          "cooldown": 12,
+          "independent": false
+        },
+        {
+          "stepIndex": 3,
+          "key": "3",
+          "slot": "3",
+          "combo": "3",
+          "skillName": "Key_3",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 5,
+          "cooldown": 5,
+          "independent": false
+        },
+        {
+          "stepIndex": 4,
+          "key": "4",
+          "slot": "4",
+          "combo": "4",
+          "skillName": "Key_4",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 23,
+          "cooldown": 23,
+          "independent": false
+        },
+        {
+          "stepIndex": 5,
+          "key": "5",
+          "slot": "5",
+          "combo": "5",
+          "skillName": "Key_5",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 20,
+          "cooldown": 20,
+          "independent": false
+        },
+        {
+          "stepIndex": 6,
+          "key": "6",
+          "slot": "6",
+          "combo": "6",
+          "skillName": "Key_6",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 5,
+          "cooldown": 5,
+          "independent": true
+        },
+        {
+          "stepIndex": 7,
+          "key": "7",
+          "slot": "7",
+          "combo": "7",
+          "skillName": "Key_7",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 60,
+          "cooldown": 60,
+          "independent": false
+        },
+        {
+          "stepIndex": 8,
+          "key": "8",
+          "slot": "8",
+          "combo": "8",
+          "skillName": "Key_8",
+          "castTimeSeconds": 4,
+          "actionType": "hold",
+          "skillCooldownSeconds": 47,
+          "cooldown": 47,
+          "independent": false
+        },
+        {
+          "stepIndex": 9,
+          "key": "9",
+          "slot": "9",
+          "combo": "9",
+          "skillName": "Key_9",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 36,
+          "cooldown": 36,
+          "independent": false
+        },
+        {
+          "stepIndex": 10,
+          "key": "0",
+          "slot": "0",
+          "combo": "0",
+          "skillName": "Key_0",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 12,
+          "cooldown": 12,
+          "independent": false
+        },
+        {
+          "stepIndex": 11,
+          "key": "-",
+          "slot": "-",
+          "combo": "-",
+          "skillName": "Key_-",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 23,
+          "cooldown": 23,
+          "independent": false
+        },
+        {
+          "stepIndex": 12,
+          "key": "=",
+          "slot": "=",
+          "combo": "=",
+          "skillName": "Key_=",
+          "castTimeSeconds": 0,
+          "actionType": "hold",
+          "skillCooldownSeconds": 10,
+          "cooldown": 10,
+          "independent": false
+        }
+      ]
+    },
+    {
+      "id": "chain_1791416219369",
+      "name": "Цепочка #3",
+      "order": 2,
+      "triggerAfter": "always",
+      "cooldownSeconds": 44,
+      "stepsCount": 1,
+      "steps": [
+        {
+          "stepIndex": 1,
+          "key": "9",
+          "slot": "9",
+          "combo": "9",
+          "skillName": "Key_9",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 6,
+          "cooldown": 6,
+          "independent": false
+        }
+      ]
+    },
+    {
+      "id": "chain_1791578238685",
+      "name": "Цепочка #4",
+      "order": 3,
+      "triggerAfter": "start",
+      "cooldownSeconds": 15,
+      "stepsCount": 9,
+      "steps": [
+        {
+          "stepIndex": 1,
+          "key": "7",
+          "slot": "7",
+          "combo": "7",
+          "skillName": "Key_7",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 6,
+          "cooldown": 6,
+          "independent": false
+        },
+        {
+          "stepIndex": 2,
+          "key": "=",
+          "slot": "=",
+          "combo": "=",
+          "skillName": "Key_=",
+          "castTimeSeconds": 4,
+          "actionType": "hold",
+          "skillCooldownSeconds": 6,
+          "cooldown": 6,
+          "independent": false
+        },
+        {
+          "stepIndex": 3,
+          "key": "2",
+          "slot": "2",
+          "combo": "2",
+          "skillName": "Key_2",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 6,
+          "cooldown": 6,
+          "independent": false
+        },
+        {
+          "stepIndex": 4,
+          "key": "2",
+          "slot": "2",
+          "combo": "2",
+          "skillName": "Key_2",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 6,
+          "cooldown": 6,
+          "independent": false
+        },
+        {
+          "stepIndex": 5,
+          "key": "2",
+          "slot": "2",
+          "combo": "2",
+          "skillName": "Key_2",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 6,
+          "cooldown": 6,
+          "independent": false
+        },
+        {
+          "stepIndex": 6,
+          "key": "1",
+          "slot": "1",
+          "combo": "1",
+          "skillName": "Key_1",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 6,
+          "cooldown": 6,
+          "independent": false
+        },
+        {
+          "stepIndex": 7,
+          "key": "3",
+          "slot": "3",
+          "combo": "3",
+          "skillName": "Key_3",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 6,
+          "cooldown": 6,
+          "independent": false
+        },
+        {
+          "stepIndex": 8,
+          "key": "4",
+          "slot": "4",
+          "combo": "4",
+          "skillName": "Key_4",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 6,
+          "cooldown": 6,
+          "independent": false
+        },
+        {
+          "stepIndex": 9,
+          "key": "5",
+          "slot": "5",
+          "combo": "5",
+          "skillName": "Key_5",
+          "castTimeSeconds": 3,
+          "actionType": "hold",
+          "skillCooldownSeconds": 6,
+          "cooldown": 6,
+          "independent": false
+        }
+      ]
+    },
+    {
+      "id": "chain_1791578289340",
+      "name": "Приоритет",
+      "order": 4,
+      "triggerAfter": "priority",
+      "cooldownSeconds": 15,
+      "stepsCount": 4,
+      "steps": [
+        {
+          "stepIndex": 1,
+          "key": "0",
+          "slot": "0",
+          "combo": "0",
+          "skillName": "Key_0",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 6,
+          "cooldown": 6,
+          "independent": false
+        },
+        {
+          "stepIndex": 2,
+          "key": "=",
+          "slot": "=",
+          "combo": "=",
+          "skillName": "Key_=",
+          "castTimeSeconds": 4,
+          "actionType": "press",
+          "skillCooldownSeconds": 6,
+          "cooldown": 6,
+          "independent": false
+        },
+        {
+          "stepIndex": 3,
+          "key": "-",
+          "slot": "-",
+          "combo": "-",
+          "skillName": "Key_-",
+          "castTimeSeconds": 0,
+          "actionType": "press",
+          "skillCooldownSeconds": 6,
+          "cooldown": 6,
+          "independent": false
+        },
+        {
+          "stepIndex": 4,
+          "key": "8",
+          "slot": "8",
+          "combo": "8",
+          "skillName": "Key_8",
+          "castTimeSeconds": 5,
+          "actionType": "hold",
+          "skillCooldownSeconds": 6,
+          "cooldown": 6,
+          "independent": false
+        }
+      ]
+    }
+  ]
+}

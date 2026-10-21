@@ -1,0 +1,14 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": true,
+ "since_entry_s": 3.5,
+ "chain": null,
+ "panel_found": true,
+ "hp": 96.4,
+ "txt": "HpText(sig=b4cbb4e9, ink=201, 10x98)",
+ "waited_s": 3.5,
+ "why": "PULL тычка есть — следующий",
+ "list": "1:8м*(92%) 2:1м(89%) 3:4м(72%) 4:26м! 5:33м 6:25м 7:29м 8:35м",
+ "event": "list_switch"
+}

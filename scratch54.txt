@@ -1,0 +1,295 @@
+yt=0 yb=10 ok=False reason=окантовка рамки вне ROI
+yt=0 yb=11 ok=False reason=окантовка рамки вне ROI
+yt=0 yb=12 ok=False reason=окантовка рамки вне ROI
+yt=0 yb=13 ok=False reason=окантовка рамки вне ROI
+yt=0 yb=14 ok=False reason=окантовка рамки вне ROI
+yt=0 yb=15 ok=False reason=окантовка рамки вне ROI
+yt=0 yb=16 ok=False reason=окантовка рамки вне ROI
+yt=0 yb=17 ok=False reason=окантовка рамки вне ROI
+yt=0 yb=18 ok=False reason=окантовка рамки вне ROI
+yt=1 yb=11 ok=False reason=нет бежевой окантовки снизу
+yt=1 yb=12 ok=False reason=нет бежевой окантовки снизу
+yt=1 yb=13 ok=False reason=нет бежевой окантовки снизу
+yt=1 yb=14 ok=False reason=нет бежевой окантовки снизу
+yt=1 yb=15 ok=False reason=нет малиновой плашки кнопки X
+yt=1 yb=16 ok=False reason=нет малиновой плашки кнопки X
+yt=1 yb=17 ok=False reason=нет малиновой плашки кнопки X
+yt=1 yb=18 ok=False reason=нет малиновой плашки кнопки X
+yt=1 yb=19 ok=False reason=линии рамки с большими разрывами
+yt=2 yb=12 ok=False reason=нет бежевой окантовки снизу
+yt=2 yb=13 ok=False reason=нет малиновой плашки кнопки X
+yt=2 yb=14 ok=False reason=нет бежевой окантовки снизу
+yt=2 yb=15 ok=False reason=нет малиновой плашки кнопки X
+yt=2 yb=16 ok=False reason=нет малиновой плашки кнопки X
+yt=2 yb=17 ok=False reason=нет малиновой плашки кнопки X
+yt=2 yb=18 ok=False reason=нет малиновой плашки кнопки X
+yt=2 yb=19 ok=False reason=нет малиновой плашки кнопки X
+yt=2 yb=20 ok=False reason=нет малиновой плашки кнопки X
+yt=3 yb=13 ok=False reason=нет бежевой окантовки снизу
+yt=3 yb=14 ok=False reason=нет бежевой окантовки снизу
+yt=3 yb=15 ok=False reason=нет малиновой плашки кнопки X
+yt=3 yb=16 ok=False reason=нет малиновой плашки кнопки X
+yt=3 yb=17 ok=False reason=нет малиновой плашки кнопки X
+yt=3 yb=18 ok=False reason=нет малиновой плашки кнопки X
+yt=3 yb=19 ok=False reason=нет малиновой плашки кнопки X
+yt=3 yb=20 ok=False reason=нет малиновой плашки кнопки X
+yt=3 yb=21 ok=False reason=нет малиновой плашки кнопки X
+yt=4 yb=14 ok=False reason=нет бежевой окантовки снизу
+yt=4 yb=15 ok=False reason=нет малиновой плашки кнопки X
+yt=4 yb=16 ok=False reason=нет малиновой плашки кнопки X
+yt=4 yb=17 ok=False reason=нет малиновой плашки кнопки X
+yt=4 yb=18 ok=False reason=нет малиновой плашки кнопки X
+yt=4 yb=19 ok=False reason=нет малиновой плашки кнопки X
+yt=4 yb=20 ok=False reason=нет малиновой плашки кнопки X
+yt=4 yb=21 ok=False reason=нет малиновой плашки кнопки X
+yt=4 yb=22 ok=False reason=нет малиновой плашки кнопки X
+yt=5 yb=15 ok=False reason=нет малиновой плашки кнопки X
+yt=5 yb=16 ok=False reason=нет малиновой плашки кнопки X
+yt=5 yb=17 ok=False reason=нет малиновой плашки кнопки X
+yt=5 yb=18 ok=False reason=нет малиновой плашки кнопки X
+yt=5 yb=19 ok=False reason=нет малиновой плашки кнопки X
+yt=5 yb=20 ok=False reason=нет малиновой плашки кнопки X
+yt=5 yb=21 ok=False reason=нет малиновой плашки кнопки X
+yt=5 yb=22 ok=False reason=нет малиновой плашки кнопки X
+yt=5 yb=23 ok=False reason=нет малиновой плашки кнопки X
+yt=6 yb=16 ok=False reason=нет малиновой плашки кнопки X
+yt=6 yb=17 ok=False reason=нет малиновой плашки кнопки X
+yt=6 yb=18 ok=False reason=нет малиновой плашки кнопки X
+yt=6 yb=19 ok=False reason=нет малиновой плашки кнопки X
+yt=6 yb=20 ok=False reason=нет малиновой плашки кнопки X
+yt=6 yb=21 ok=False reason=нет правой границы рамки
+yt=6 yb=22 ok=False reason=нет малиновой плашки кнопки X
+yt=6 yb=23 ok=False reason=нет малиновой плашки кнопки X
+yt=7 yb=17 ok=False reason=нет малиновой плашки кнопки X
+yt=7 yb=18 ok=False reason=нет малиновой плашки кнопки X
+yt=7 yb=19 ok=False reason=нет малиновой плашки кнопки X
+yt=7 yb=20 ok=False reason=нет малиновой плашки кнопки X
+yt=7 yb=21 ok=False reason=нет правой границы рамки
+yt=7 yb=22 ok=False reason=нет правой границы рамки
+yt=7 yb=23 ok=False reason=нет малиновой плашки кнопки X
+yt=7 yb=25 ok=False reason=нет бежевой окантовки снизу
+yt=8 yb=18 ok=False reason=нет малиновой плашки кнопки X
+yt=8 yb=19 ok=False reason=нет малиновой плашки кнопки X
+yt=8 yb=20 ok=False reason=нет малиновой плашки кнопки X
+yt=8 yb=21 ok=False reason=нет правой границы рамки
+yt=8 yb=22 ok=False reason=нет правой границы рамки
+yt=8 yb=23 ok=False reason=нет малиновой плашки кнопки X
+yt=8 yb=25 ok=False reason=нет бежевой окантовки снизу
+yt=8 yb=26 ok=False reason=нет бежевой окантовки снизу
+yt=9 yb=19 ok=False reason=нет малиновой плашки кнопки X
+yt=9 yb=20 ok=False reason=нет малиновой плашки кнопки X
+yt=9 yb=21 ok=False reason=нет правой границы рамки
+yt=9 yb=22 ok=False reason=нет правой границы рамки
+yt=9 yb=23 ok=False reason=нет малиновой плашки кнопки X
+yt=9 yb=25 ok=False reason=нет бежевой окантовки снизу
+yt=9 yb=26 ok=False reason=нет бежевой окантовки снизу
+yt=9 yb=27 ok=False reason=нет бежевой окантовки снизу
+yt=10 yb=20 ok=False reason=нет малиновой плашки кнопки X
+yt=10 yb=21 ok=False reason=нет правой границы рамки
+yt=10 yb=22 ok=False reason=нет правой границы рамки
+yt=10 yb=23 ok=False reason=нет малиновой плашки кнопки X
+yt=10 yb=25 ok=False reason=нет бежевой окантовки снизу
+yt=10 yb=26 ok=False reason=нет бежевой окантовки снизу
+yt=10 yb=27 ok=False reason=нет бежевой окантовки снизу
+yt=10 yb=28 ok=False reason=нет бежевой окантовки снизу
+yt=11 yb=21 ok=False reason=нет правой границы рамки
+yt=11 yb=22 ok=False reason=нет правой границы рамки
+yt=11 yb=23 ok=False reason=нет малиновой плашки кнопки X
+yt=11 yb=25 ok=False reason=нет бежевой окантовки снизу
+yt=11 yb=26 ok=False reason=нет бежевой окантовки снизу
+yt=11 yb=27 ok=False reason=нет бежевой окантовки снизу
+yt=11 yb=28 ok=False reason=нет бежевой окантовки снизу
+yt=11 yb=29 ok=False reason=нет малиновой плашки кнопки X
+yt=12 yb=22 ok=False reason=длина линий 99 px вне диапазона
+yt=12 yb=23 ok=False reason=линии рамки с большими разрывами
+yt=12 yb=25 ok=False reason=нет бежевой окантовки снизу
+yt=12 yb=26 ok=False reason=нет бежевой окантовки снизу
+yt=12 yb=27 ok=False reason=нет бежевой окантовки снизу
+yt=12 yb=28 ok=False reason=нет бежевой окантовки снизу
+yt=12 yb=29 ok=False reason=нет малиновой плашки кнопки X
+yt=12 yb=30 ok=False reason=нет малиновой плашки кнопки X
+yt=13 yb=23 ok=False reason=линии рамки с большими разрывами
+yt=13 yb=25 ok=False reason=нет малиновой плашки кнопки X
+yt=13 yb=26 ok=False reason=нет бежевой окантовки снизу
+yt=13 yb=27 ok=False reason=нет бежевой окантовки снизу
+yt=13 yb=28 ok=False reason=нет бежевой окантовки снизу
+yt=13 yb=29 ok=False reason=нет малиновой плашки кнопки X
+yt=13 yb=30 ok=False reason=нет малиновой плашки кнопки X
+yt=14 yb=25 ok=False reason=нет правой границы рамки
+yt=14 yb=26 ok=False reason=нет правой границы рамки
+yt=14 yb=27 ok=False reason=нет правой границы рамки
+yt=14 yb=28 ok=False reason=нет правой границы рамки
+yt=14 yb=29 ok=False reason=нет правой границы рамки
+yt=14 yb=30 ok=False reason=нет малиновой плашки кнопки X
+yt=15 yb=25 ok=False reason=нет правой границы рамки
+yt=15 yb=26 ok=False reason=нет правой границы рамки
+yt=15 yb=27 ok=False reason=нет правой границы рамки
+yt=15 yb=28 ok=False reason=нет правой границы рамки
+yt=15 yb=29 ok=False reason=нет правой границы рамки
+yt=15 yb=30 ok=False reason=нет правой границы рамки
+yt=16 yb=26 ok=False reason=нет бежевой окантовки снизу
+yt=16 yb=27 ok=False reason=нет бежевой окантовки снизу
+yt=16 yb=28 ok=False reason=нет бежевой окантовки снизу
+yt=16 yb=29 ok=False reason=нет бежевой окантовки снизу
+yt=16 yb=30 ok=False reason=нет малиновой плашки кнопки X
+yt=17 yb=27 ok=False reason=нет бежевой окантовки снизу
+yt=17 yb=28 ok=False reason=нет бежевой окантовки снизу
+yt=17 yb=29 ok=False reason=нет бежевой окантовки снизу
+yt=17 yb=30 ok=False reason=нет малиновой плашки кнопки X
+yt=18 yb=28 ok=False reason=нет бежевой окантовки снизу
+yt=18 yb=29 ok=False reason=нет бежевой окантовки снизу
+yt=18 yb=30 ok=False reason=нет малиновой плашки кнопки X
+yt=19 yb=29 ok=False reason=нет бежевой окантовки снизу
+yt=19 yb=30 ok=False reason=линии рамки с большими разрывами
+yt=20 yb=30 ok=False reason=линии рамки с большими разрывами
+yt=30 yb=48 ok=False reason=нет правой границы рамки
+yt=48 yb=58 ok=False reason=нет бежевой окантовки снизу
+yt=48 yb=59 ok=False reason=длина линий 72 px вне диапазона
+yt=48 yb=60 ok=False reason=длина линий 69 px вне диапазона
+yt=48 yb=61 ok=False reason=длина линий 80 px вне диапазона
+yt=48 yb=62 ok=False reason=длина линий 106 px вне диапазона
+yt=48 yb=63 ok=False reason=длина линий 72 px вне диапазона
+yt=48 yb=64 ok=False reason=длина линий 108 px вне диапазона
+yt=48 yb=65 ok=False reason=нет бежевой окантовки снизу
+yt=48 yb=66 ok=False reason=нет бежевой окантовки снизу
+yt=49 yb=59 ok=False reason=нет бежевой окантовки снизу
+yt=49 yb=60 ok=False reason=нет бежевой окантовки снизу
+yt=49 yb=61 ok=False reason=нет бежевой окантовки снизу
+yt=49 yb=62 ok=False reason=нет бежевой окантовки снизу
+yt=49 yb=63 ok=False reason=нет бежевой окантовки снизу
+yt=49 yb=64 ok=False reason=нет бежевой окантовки снизу
+yt=49 yb=65 ok=False reason=нет бежевой окантовки снизу
+yt=49 yb=66 ok=False reason=нет бежевой окантовки снизу
+yt=49 yb=67 ok=False reason=нет малиновой плашки кнопки X
+yt=50 yb=60 ok=False reason=нет бежевой окантовки снизу
+yt=50 yb=61 ok=False reason=нет бежевой окантовки снизу
+yt=50 yb=62 ok=False reason=нет бежевой окантовки снизу
+yt=50 yb=63 ok=False reason=нет бежевой окантовки снизу
+yt=50 yb=64 ok=False reason=нет бежевой окантовки снизу
+yt=50 yb=65 ok=False reason=нет бежевой окантовки снизу
+yt=50 yb=66 ok=False reason=нет бежевой окантовки снизу
+yt=50 yb=67 ok=False reason=нет малиновой плашки кнопки X
+yt=50 yb=68 ok=False reason=нет малиновой плашки кнопки X
+yt=51 yb=61 ok=False reason=нет бежевой окантовки снизу
+yt=51 yb=62 ok=False reason=нет бежевой окантовки снизу
+yt=51 yb=63 ok=False reason=нет бежевой окантовки снизу
+yt=51 yb=64 ok=False reason=нет бежевой окантовки снизу
+yt=51 yb=65 ok=False reason=нет бежевой окантовки снизу
+yt=51 yb=66 ok=False reason=нет бежевой окантовки снизу
+yt=51 yb=67 ok=False reason=нет малиновой плашки кнопки X
+yt=51 yb=68 ok=False reason=нет малиновой плашки кнопки X
+yt=52 yb=62 ok=False reason=нет бежевой окантовки снизу
+yt=52 yb=63 ok=False reason=нет бежевой окантовки снизу
+yt=52 yb=64 ok=False reason=нет бежевой окантовки снизу
+yt=52 yb=65 ok=False reason=нет бежевой окантовки снизу
+yt=52 yb=66 ok=False reason=нет бежевой окантовки снизу
+yt=52 yb=67 ok=False reason=нет малиновой плашки кнопки X
+yt=52 yb=68 ok=False reason=нет малиновой плашки кнопки X
+yt=52 yb=70 ok=False reason=нет бежевой окантовки снизу
+yt=53 yb=63 ok=False reason=нет бежевой окантовки снизу
+yt=53 yb=64 ok=False reason=нет бежевой окантовки снизу
+yt=53 yb=65 ok=False reason=нет бежевой окантовки снизу
+yt=53 yb=66 ok=False reason=нет бежевой окантовки снизу
+yt=53 yb=67 ok=False reason=нет малиновой плашки кнопки X
+yt=53 yb=68 ok=False reason=нет малиновой плашки кнопки X
+yt=53 yb=70 ok=False reason=нет бежевой окантовки снизу
+yt=54 yb=64 ok=False reason=нет бежевой окантовки снизу
+yt=54 yb=65 ok=False reason=нет бежевой окантовки снизу
+yt=54 yb=66 ok=False reason=нет бежевой окантовки снизу
+yt=54 yb=67 ok=False reason=нет малиновой плашки кнопки X
+yt=54 yb=68 ok=False reason=нет малиновой плашки кнопки X
+yt=54 yb=70 ok=False reason=нет бежевой окантовки снизу
+yt=55 yb=65 ok=False reason=нет бежевой окантовки снизу
+yt=55 yb=66 ok=False reason=нет бежевой окантовки снизу
+yt=55 yb=67 ok=False reason=нет малиновой плашки кнопки X
+yt=55 yb=68 ok=False reason=нет малиновой плашки кнопки X
+yt=55 yb=70 ok=False reason=нет бежевой окантовки снизу
+yt=56 yb=66 ok=False reason=нет бежевой окантовки снизу
+yt=56 yb=67 ok=False reason=нет малиновой плашки кнопки X
+yt=56 yb=68 ok=False reason=нет малиновой плашки кнопки X
+yt=56 yb=70 ok=False reason=нет бежевой окантовки снизу
+yt=57 yb=67 ok=False reason=нет малиновой плашки кнопки X
+yt=57 yb=68 ok=False reason=нет малиновой плашки кнопки X
+yt=57 yb=70 ok=False reason=нет бежевой окантовки снизу
+yt=58 yb=68 ok=False reason=нет малиновой плашки кнопки X
+yt=58 yb=70 ok=False reason=нет бежевой окантовки снизу
+yt=58 yb=76 ok=False reason=нет правой границы рамки
+yt=59 yb=70 ok=False reason=нет бежевой окантовки снизу
+yt=59 yb=76 ok=False reason=нет правой границы рамки
+yt=59 yb=77 ok=False reason=нет правой границы рамки
+yt=60 yb=70 ok=False reason=нет бежевой окантовки снизу
+yt=60 yb=76 ok=False reason=нет правой границы рамки
+yt=60 yb=77 ok=False reason=нет правой границы рамки
+yt=60 yb=78 ok=False reason=нет правой границы рамки
+yt=61 yb=76 ok=False reason=нет правой границы рамки
+yt=61 yb=77 ok=False reason=нет правой границы рамки
+yt=61 yb=78 ok=False reason=нет правой границы рамки
+yt=61 yb=79 ok=False reason=нет правой границы рамки
+yt=62 yb=76 ok=False reason=нет правой границы рамки
+yt=62 yb=77 ok=False reason=нет правой границы рамки
+yt=62 yb=78 ok=False reason=нет правой границы рамки
+yt=62 yb=79 ok=False reason=нет правой границы рамки
+yt=62 yb=80 ok=False reason=нет правой границы рамки
+yt=63 yb=76 ok=False reason=нет правой границы рамки
+yt=63 yb=77 ok=False reason=нет правой границы рамки
+yt=63 yb=78 ok=False reason=нет правой границы рамки
+yt=63 yb=79 ok=False reason=нет правой границы рамки
+yt=63 yb=80 ok=False reason=нет правой границы рамки
+yt=63 yb=81 ok=False reason=нет правой границы рамки
+yt=64 yb=76 ok=False reason=нет правой границы рамки
+yt=64 yb=77 ok=False reason=нет правой границы рамки
+yt=64 yb=78 ok=False reason=нет правой границы рамки
+yt=64 yb=79 ok=False reason=нет правой границы рамки
+yt=64 yb=80 ok=False reason=нет правой границы рамки
+yt=64 yb=81 ok=False reason=нет правой границы рамки
+yt=64 yb=82 ok=False reason=нет правой границы рамки
+yt=65 yb=76 ok=False reason=нет правой границы рамки
+yt=65 yb=77 ok=False reason=нет правой границы рамки
+yt=65 yb=78 ok=False reason=нет правой границы рамки
+yt=65 yb=79 ok=False reason=нет правой границы рамки
+yt=65 yb=80 ok=False reason=нет правой границы рамки
+yt=65 yb=81 ok=False reason=нет правой границы рамки
+yt=65 yb=82 ok=False reason=нет правой границы рамки
+yt=65 yb=83 ok=False reason=нет правой границы рамки
+yt=66 yb=76 ok=False reason=нет правой границы рамки
+yt=66 yb=77 ok=False reason=нет правой границы рамки
+yt=66 yb=78 ok=False reason=нет правой границы рамки
+yt=66 yb=79 ok=False reason=нет правой границы рамки
+yt=66 yb=80 ok=False reason=нет правой границы рамки
+yt=66 yb=81 ok=False reason=нет правой границы рамки
+yt=66 yb=82 ok=False reason=нет правой границы рамки
+yt=66 yb=83 ok=False reason=нет правой границы рамки
+yt=66 yb=84 ok=False reason=нет правой границы рамки
+yt=67 yb=77 ok=False reason=нет правой границы рамки
+yt=67 yb=78 ok=False reason=нет правой границы рамки
+yt=67 yb=79 ok=False reason=нет правой границы рамки
+yt=67 yb=80 ok=False reason=нет правой границы рамки
+yt=67 yb=81 ok=False reason=нет правой границы рамки
+yt=67 yb=82 ok=False reason=нет правой границы рамки
+yt=67 yb=83 ok=False reason=нет правой границы рамки
+yt=67 yb=84 ok=False reason=нет правой границы рамки
+yt=67 yb=85 ok=False reason=нет правой границы рамки
+yt=68 yb=78 ok=False reason=нет правой границы рамки
+yt=68 yb=79 ok=False reason=нет правой границы рамки
+yt=68 yb=80 ok=False reason=нет правой границы рамки
+yt=68 yb=81 ok=False reason=нет правой границы рамки
+yt=68 yb=82 ok=False reason=нет правой границы рамки
+yt=68 yb=83 ok=False reason=нет правой границы рамки
+yt=68 yb=84 ok=False reason=нет правой границы рамки
+yt=68 yb=85 ok=False reason=нет правой границы рамки
+yt=68 yb=86 ok=False reason=нет правой границы рамки
+yt=70 yb=80 ok=False reason=нет правой границы рамки
+yt=70 yb=81 ok=False reason=нет правой границы рамки
+yt=70 yb=82 ok=False reason=нет правой границы рамки
+yt=70 yb=83 ok=False reason=нет правой границы рамки
+yt=70 yb=84 ok=False reason=нет правой границы рамки
+yt=70 yb=85 ok=False reason=нет правой границы рамки
+yt=70 yb=86 ok=False reason=нет бежевой окантовки снизу
+yt=70 yb=87 ok=False reason=нет бежевой окантовки снизу
+yt=70 yb=88 ok=False reason=окантовка рамки вне ROI
+yt=76 yb=86 ok=False reason=нет бежевой окантовки снизу
+yt=76 yb=87 ok=False reason=нет бежевой окантовки снизу
+yt=76 yb=88 ok=False reason=окантовка рамки вне ROI
+yt=77 yb=87 ok=False reason=нет бежевой окантовки снизу
+yt=77 yb=88 ok=False reason=окантовка рамки вне ROI
+yt=78 yb=88 ok=False reason=окантовка рамки вне ROI

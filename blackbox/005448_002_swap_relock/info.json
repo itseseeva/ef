@@ -1,0 +1,12 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": false,
+ "since_entry_s": 0.0,
+ "chain": "Цепочка #4",
+ "panel_found": true,
+ "hp": 100.0,
+ "txt": "HpText(sig=591fa8b1, ink=181, 10x98)",
+ "why": "hp 11% -> 100%",
+ "event": "swap_relock"
+}

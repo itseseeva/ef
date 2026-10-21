@@ -1,0 +1,38 @@
+def update(self, msgs: "list[ChatMessage]", sig: object, now: float) -> "list[ChatMessage]":
+        """
+        Логика без зрения (тестируется отдельно): прочитанные сейчас сообщения -> новые.
+        sig — отпечаток картинки: голос в прочтение добавляем, только если картинка новая.
+        """
+        self._tracks = [t for t in self._tracks if now - t.last <= self.SEEN_TTL_S]
+        fresh: "list[_Track]" = []
+        pos = 0
+        for m in msgs:
+            i = self._match(m, pos)
+            if i is None:
+                t = _Track(m, now)
+                self._tracks.append(t)
+                fresh.append(t)
+                pos = len(self._tracks)
+            else:
+                t = self._tracks[i]
+                pos = i + 1
+                if sig != getattr(self, "_voted_sig", None):
+                    t.reads.append(m.text)        # голос — только от новой картинки
+                t.last = now
+                t.polls += 1
+                t.header_y = m.header_y
+        self._voted_sig = sig
+        if not self._primed:
+            self._primed = True
+            for t in self._tracks:
+                t.emitted = True                  # было до старта — не наше
+            return []
+        if len(fresh) >= 2:
+            for t in fresh[:-1]:
+                t.emitted = True                  # закрытый чат "вспомнил" старые — новое только нижнее
+        out = []
+        for t in self._tracks:
+            if not t.emitted and now - t.first >= self.STABLE_S and t.polls >= 2:
+                t.emitted = True
+                out.append(ChatMessage(t.channel, t.sender, t.best(), "", t.header_y))
+        return out

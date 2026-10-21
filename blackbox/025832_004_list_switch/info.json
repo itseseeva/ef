@@ -1,0 +1,14 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": true,
+ "since_entry_s": 15.58,
+ "chain": "1 (доигрываю)",
+ "panel_found": true,
+ "hp": 40.29,
+ "txt": "HpText(sig=bd8a96f3, ink=149, 10x98)",
+ "waited_s": 15.577999999979511,
+ "why": "раненый №8 (HP 8%, 29 м) висит в списке, а наша цель 40% — добиваю его",
+ "list": "1:15м*!(42%) 2:9м!(87%) 3:18м 4:13м 5:14м 6:9м 7:24м 8:29м(8%)",
+ "event": "list_switch"
+}

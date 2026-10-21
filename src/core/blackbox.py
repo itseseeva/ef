@@ -86,7 +86,7 @@ def _imwrite(path: str, img: np.ndarray, params=()) -> None:
 
 def _dump_event(folder: str, ring_frames: "list[tuple[float, np.ndarray]]",
                 panel_now: "np.ndarray | None", world: "np.ndarray | None",
-                info: dict) -> None:
+                info: dict, images: "dict | None" = None) -> None:
     """Всё тяжёлое (PNG/JPEG, JSON) — здесь, в потоке-писателе."""
     os.makedirs(folder, exist_ok=True)
     t_event = info.get("_t", 0.0)
@@ -96,6 +96,9 @@ def _dump_event(folder: str, ring_frames: "list[tuple[float, np.ndarray]]",
         _imwrite(os.path.join(folder, "panel_now.png"), panel_now)
     if world is not None:
         _imwrite(os.path.join(folder, "world.jpg"), world, (cv2.IMWRITE_JPEG_QUALITY, 85))
+    for name, img in (images or {}).items():         # доп. кадры события (например, список целей)
+        if img is not None:
+            _imwrite(os.path.join(folder, name), img)
     clean = {k: v for k, v in info.items() if not k.startswith("_")}
     with open(os.path.join(folder, "info.json"), "w", encoding="utf-8") as f:
         json.dump(clean, f, ensure_ascii=False, indent=1, default=str)
@@ -127,7 +130,7 @@ class BlackBox:
 
     def event(self, now: float, name: str, info: "dict | None" = None,
               panel_frame: "np.ndarray | None" = None, world_frame: "np.ndarray | None" = None,
-              use_ring: bool = True) -> "str | None":
+              use_ring: bool = True, images: "dict | None" = None) -> "str | None":
         """
         Сохранить инцидент. Возвращает папку или None (выключено / исчерпан лимит).
         Лимиты — чтобы один частый тип события не забил диск: всего max_events на
@@ -149,6 +152,7 @@ class BlackBox:
             _dump_event, folder, ring,
             None if panel_frame is None else panel_frame.copy(),
             world_frame, data,
+            {k: v.copy() for k, v in images.items()} if images else None,
         )
         return folder if ok else None
 

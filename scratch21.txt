@@ -1,0 +1,20 @@
+            return
+        # is_idle(): Tab не вклинивается в середину захвата/удара, ещё стоящих в очереди.
+        if not self.input_manager.is_idle():
+            return
+        # Единый шлюз смены цели. Здесь моб не тронут, и ответ "да"; проверка — чтобы
+        # будущая правка не обошла охранника этим путём.
+        if not self._guard_allows(now, "tab"):
+            self._eg_deadline = now + random.uniform(*self._ENGAGE_RETAB_EVERY_S)
+            return
+        if self._try_list_switch(now):
+            return
+        if not self._list_drives() and self._try_vision_switch(now):
+            return
+        self._eg_retabs += 1
+        gamepad_debug_logger.debug(
+            "ENGAGE  HP не менялось %.1f с — Tab %d/%d -> ПКМ",
+            now - self._eg_wait_since, self._eg_retabs, self._ENGAGE_MAX_RETABS,
+        )
+        self._bb_event(now, "engage_retab", {"n": self._eg_retabs, "waited_s": now - self._eg_wait_since,
+                                             "hp": self._eg_base_hp})

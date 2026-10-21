@@ -1,0 +1,64 @@
+def parse(lines: "list[tuple]", merge_gap: int = MERGE_GAP) -> "list[ChatMessage]":
+    """
+    [(канал, распознанный текст, y0, y1, заголовок?)] сверху вниз -> сообщения. Чистая функция.
+    Заголовок (значок канала слева) — ник: самое длинное слово-имя (значки OCR читает обрывками
+    вроде "@}" и "WF"). Остальные строки — текст сообщения от последнего ника этого канала;
+    время в конце ("20:46", есть только в открытом чате) отрезаем.
+    Без флага заголовка (старый формат: 2-4 поля) — заголовок там, где нет времени.
+    """
+    out: "list[ChatMessage]" = []
+    sender: "dict[str, str | None]" = {WHISPER: None, NORMAL: None}
+    header: "dict[str, tuple[int, int] | None]" = {WHISPER: None, NORMAL: None}
+    prev_y1: "int | None" = None
+    hs = sorted(int(it[3]) - int(it[2]) for it in lines if len(it) >= 4)
+    med_h = hs[len(hs) // 2] if hs else 0
+    for item in lines:
+        channel, raw = item[0], item[1]
+        yy = (int(item[2]), int(item[3])) if len(item) >= 4 else None
+        s = " ".join(raw.split())
+        if not s or _DATE_RE.match(s):
+            continue
+        m = _TIME_RE.search(s)
+        if m is None:
+            # Время мелким шрифтом OCR читает без двоеточия ("123 2050", "ау ау 2127"): 4 цифры
+            # ЧЧММ в конце после пробела — время, если перед ним есть текст и часы/минуты валидны.
+            m2 = _TIME_LOOSE_RE.search(s)
+            if m2 and m2.start() > 0 and int(m2.group(1)) < 24 and int(m2.group(2)) < 60:
+                m = m2
+        is_header = bool(item[4]) if len(item) >= 5 else m is None
+        if is_header:
+            names = _NAME_RE.findall(s)
+            if names:
+                sender[channel] = max(names, key=len)
+                header[channel] = yy
+            prev_y1 = None                           # после заголовка — всегда новое сообщение
+            continue
+        body = (s[:m.start()] if m else s).strip(" .,:;-")
+        if body and not _looks_like_text(body):
+            prev_y1 = yy[1] if yy is not None else None   # мусор (блик/трава прочитались) — пропуск
+            continue
+        # Без ника выше в зоне — не сообщение (это другие строки интерфейса над окном чата:
+        # имена группы и т.п.) либо заголовок уехал вверх. Отвечать некому — пропускаем.
+        if body and sender[channel] is not None:
+            tm = "%02d:%s" % (int(m.group(1)), m.group(2)) if m else ""
+            # ПЕРЕНОС длинного сообщения (скрин 2026-10-07, SenseiGG — 3 строки): строки одного
+            # сообщения идут плотно (зазор ~5 px), разные сообщения — с зазором 9-14 px и чертой.
+            # Плотную строку без своего времени клеим к предыдущему сообщению того же ника.
+            prev = out[-1] if out else None
+            gap_ok = False
+            if yy is not None and prev_y1 is not None:
+                # Порог — от высоты строки: крупный шрифт чата (2026-10-07) — перенос 8-11 px,
+                # новое сообщение 18+ px; мелкий — 5 и 9-14 px. 0.8 высоты строки делит оба.
+                # Высота строки — МЕДИАНА по всем строкам кадра: над светлым миром отдельные полосы
+                # раздувает шум, и порог от них склеивал "ау ау" с "Ты тут ?".
+                gap_ok = yy[0] - prev_y1 <= max(merge_gap, 0.8 * med_h)
+            if (prev is not None and gap_ok and prev.channel == channel
+                    and prev.sender == sender[channel] and not prev.time):
+                out[-1] = ChatMessage(channel, prev.sender, prev.text + " " + body, tm, prev.header_y)
+            else:
+                out.append(ChatMessage(channel, sender[channel], body, tm, header[channel]))
+        prev_y1 = yy[1] if yy is not None else None
+    return out
+
+
+def 

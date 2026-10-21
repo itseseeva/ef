@@ -1,0 +1,30 @@
+            return
+        input_debug_logger.debug("ATTACK  %s ещё раз%s", key.upper(),
+                                 " (отпустил %s)" % "+".join(sorted(released)) if released else "")
+        if not self._down(key):
+            return
+        with self._io_lock:
+            self.clicks_pressed += 1
+            self._click_guard_until = time.monotonic() + self._CLICK_MOVE_GUARD_S
+        try:
+            self._interruptible_sleep(random.uniform(*self._HOLD_KEY_MS) / 1000.0)
+        finally:
+            self._up(key)
+
+    def click_at(self, x: float, y: float, button: str = "left", strafe: bool = False) -> None:
+        """
+        Клик мышью (button: "left"/"right") по точке экрана с курсором: Alt (появляется
+        курсор) -> движение курсора по человеческой кривой -> клик -> отпустить Alt.
+        Список целей бот кликает ПРАВОЙ: так персонаж сразу бежит к мобу. Команда очереди:
+        не вклинится в комбо. Камера на это время заморожена (_camera_hold): иначе
+        поток камеры двигал бы мышью сам курсор, и клик ушёл бы мимо.
+        Как проверить без игры: InputManager(backend=DryRunBackend()).click_at(130, 567),
+        wait_idle() — в backend.calls путь курсора ("mouse_abs") и порядок Alt/ЛКМ.
+
+        strafe=True (2026-10-04, "чтобы бот не стоял, пока ведёт мышь к списку"): ДО Alt
+        зажимаем A или D и держим, пока курсор едет, — отпускаем прямо перед кнопкой мыши
+        (клавиша движения в момент клика оборвала бы бег к цели). Новые клавиши при
+        зажатом Alt не жмём: Alt+A/Alt+D — уже сочетания игры.
+        """
+        self._queue.put(("click_at", float(x), float(y), button, bool(strafe)))
+

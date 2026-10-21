@@ -1,0 +1,12 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": false,
+ "since_entry_s": 0.0,
+ "chain": null,
+ "panel_found": true,
+ "hp": 98.56,
+ "txt": "HpText(sig=6192deaa, ink=191, 10x98)",
+ "why": "панель пропадала 0.41с и вернулась",
+ "event": "swap_relock"
+}

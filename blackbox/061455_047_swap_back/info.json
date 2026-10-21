@@ -1,0 +1,16 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": true,
+ "since_entry_s": 7.05,
+ "chain": null,
+ "panel_found": true,
+ "hp": 80.58,
+ "txt": "HpText(sig=c89a1a64, ink=246, 10x98)",
+ "old_hp": 16.425,
+ "new_hp": 80.58,
+ "old_dist": 4,
+ "row": 3,
+ "list": "2:3м*!(80%) 3:2м(26%) 4:16м(20%) 5:16м(80%) 6:22м! 7:26м 8:30м",
+ "event": "swap_back"
+}

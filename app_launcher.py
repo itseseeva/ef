@@ -59,27 +59,19 @@ _DIST_INDEX = os.path.join(os.path.dirname(__file__), "dist", "index.html")
 # запуске (см. _sync_icons_to_dist), потому что npm run build перезаписывает
 # всю папку dist/ целиком и стирает всё, что там лежало раньше.
 _DIST_ICONS_DIR = os.path.join(os.path.dirname(__file__), "dist", "icons")
+# Срок таймера автоостановки — файлом рядом с программой (переживает перезапуск окна).
+_SHUTDOWN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shutdown_timer.json")
+# Настройки окна, которые переживают перезапуск (окно в private_mode — localStorage не годится):
+# сейчас только выключатель "Чат-бот".
+_UI_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui_state.json")
 
-# Виртуальный код клавиши F4 (WinAPI VK-таблица: F4 = 0x73) — перенесено
-# как есть из main.py, тот же хоткей "старт/стоп", что был там.
-_HOTKEY_TOGGLE_VK = 0x73
+# Старт/стоп бота — клавиша End (WinAPI VK-таблица: VK_END = 0x23). 2026-10-05: раньше
+# были F4 и F5, но F1-F8 теперь бинды выбора цели в игре (бот сам жмёт их) — старт/стоп
+# переехал на End, которую ни игра, ни бот не используют.
+_HOTKEY_TOGGLE_VK = 0x23
 
-# F5 (0x74, следующий код в VK-таблице сразу за F4) — ВТОРОЙ хоткей на
-# то же самое действие (старт/стоп), не новая функция. Добавлен по
-# просьбе: в старом main.py F5 был "тест-прогон", и рука уже привыкла
-# тянуться именно к нему — проще дать ему тот же смысл, что и F4, чем
-# переучивать привычку. Оба живут независимо (см. _global_hotkey_watcher):
-# нажатие любого из двух переключает бота, они не мешают друг другу.
-_HOTKEY_TOGGLE_VK_ALT = 0x74
-
-# F6 (0x75) — ГЛОБАЛЬНЫЙ хоткей на test_rotation() (та же логика, что и
-# кнопка "Тест" в интерфейсе): прогоняет все цепочки вхолостую, БЕЗ
-# VisionManager и БЕЗ доворота камеры — чистая проверка "правильно ли
-# нажимаются скиллы". Раньше это можно было запустить только мышкой из
-# окна EasyFarm — неудобно, если стоишь в игре с реальной целью и хочешь
-# сразу увидеть, как ротация отработает по-настоящему, не переключаясь
-# на другое окно.
-_HOTKEY_TEST_VK = 0x75
+# Других глобальных хоткеев нет (2026-10-05): F1-F8 — бинды выбора цели в игре, и любой
+# F-хоткей приложения срабатывал бы от них. Тест комбо — только кнопкой "Тест" в окне.
 
 # Как часто опрашиваем клавишу. 50мс с большим запасом достаточно для
 # реакции человека и никак не связано с 60 FPS циклом самого бота — тот
@@ -197,14 +189,44 @@ class Api:
         # время работы окна, отдельным потоком-демоном (тот же приём, что
         # и с self._bot_thread ниже) — не мешает GUI перерисовываться.
         self._hotkey_thread = threading.Thread(
-            target=self._global_hotkey_watcher, daemon=True, name="GlobalHotkeyF4F5F6"
+            target=self._global_hotkey_watcher, daemon=True, name="GlobalHotkeyEnd"
         )
         self._hotkey_thread.start()
 
+        # Таймер автоостановки (часики слева от "Старт", 2026-10-10). Срок храним ЗДЕСЬ, а не
+        # только в браузере: (1) WebView2 почти усыпляет таймеры JS, когда окно свёрнуто, —
+        # остановка опоздала бы до минуты; (2) окно у нас в private_mode — localStorage не
+        # переживает перезапуск, а файл переживает.
+        self._window = None                       # main() подставит окно — для уведомления интерфейса
+        self._shutdown_lock = threading.Lock()
+        # Два режима (2026-10-10): "duration" — "бот работает N минут": срок взводится, отсчёт
+        # идёт С МОМЕНТА СТАРТА бота (кнопкой или End), на Стоп отсчёт снимается, а N минут
+        # остаются взведены до отмены; "clock" — "остановить в ЧЧ:ММ" — по часам.
+        self._shutdown_mode: str | None = None
+        self._shutdown_armed_s: float | None = None
+        self._shutdown_deadline: float | None = None
+        self._load_shutdown_state()
+        threading.Thread(target=self._shutdown_watcher, daemon=True, name="ShutdownTimer").start()
+
+        # Итог последней сессии (окно "Итог сессии"): интерфейс мог перезагрузиться и пропустить
+        # событие — тогда заберёт его через get_last_session().
+        self._last_session: dict | None = None
+        self._last_session_start: float | None = None
+        # Снимок скиллов: один за раз (двойной клик не запустит вторую съёмку поверх первой).
+        self._capture_lock = threading.Lock()
+        # Чат-бот: выключатель в интерфейсе. Включён = работает вместе с ботом (стартует на "Старт",
+        # засыпает на "Стоп"); выключен — не стартует, а работающий останавливается.
+        self._chat_enabled = self._load_ui_state().get("chat_enabled", True)
+        # Режим фарма (2026-10-20): "pull" — агр мобов тычками и бой у дома, "normal" — бить всех без агра.
+        # Хранится в ui_state.json, как чат; применяется на каждом "Старт" (bot.pull_mode).
+        self._farm_mode = self._initial_farm_mode()
+        self._chat_thread: threading.Thread | None = None
+        self._chat_stop: threading.Event | None = None
+
     def _toggle_bot(self, key_label: str) -> None:
         """
-        Общая логика "старт/стоп" для ЛЮБОГО хоткея-переключателя (сейчас их
-        два — F4 и F5, см. _HOTKEY_TOGGLE_VK/_HOTKEY_TOGGLE_VK_ALT). Вынесено
+        Общая логика "старт/стоп" для хоткея-переключателя (сейчас это End,
+        см. _HOTKEY_TOGGLE_VK). Вынесено
         в отдельный метод, а не продублировано в watcher-цикле дважды под
         каждую клавишу — одна точка правки, если логика переключения
         когда-нибудь изменится.
@@ -219,20 +241,25 @@ class Api:
             logger.info("%s (глобально): бот не запущен — запускаю.", key_label)
             self.start_bot()
 
+    def _bot_pressed(self, key: str) -> bool:
+        """Эту клавишу только что нажал сам бот (InputManager.injected_recently), а не человек."""
+        bot = getattr(self, "_bot", None)
+        im = getattr(bot, "input_manager", None) if bot is not None else None
+        fn = getattr(im, "injected_recently", None)
+        return bool(fn is not None and fn(key))
+
     def _global_hotkey_watcher(self) -> None:
         """
         Крутится в фоне всё время жизни окна и раз в
-        _HOTKEY_POLL_INTERVAL_SEC проверяет, не нажали ли F4, F5 или F6 —
+        _HOTKEY_POLL_INTERVAL_SEC проверяет, не нажали ли End (старт/стоп) —
         работает, даже когда фокус ОС стоит на окне игры, а не на EasyFarm
         (см. docstring _is_key_down выше, там объяснение ПОЧЕМУ это важно).
 
         Ловим именно ФРОНТ нажатия (переход "не зажата" -> "зажата"), а не
         сам факт "зажата прямо сейчас" — иначе, пока игрок физически
         держит клавишу дольше одного опроса (50мс), действие сработало бы
-        десятки раз подряд без остановки. was_pressed_f4/f5/f6 — это
-        "снимок" состояния КАЖДОЙ клавиши на прошлом опросе, с которым
-        сравниваем текущий — у каждой клавиши СВОЙ снимок, иначе, например,
-        зажатый F4 мог бы через was_pressed повлиять на детект фронта у F5.
+        десятки раз подряд без остановки. was_pressed_end — это
+        "снимок" состояния клавиши на прошлом опросе, с которым сравниваем текущий.
         """
         # CoInitializeEx(None, 0) — COINIT_MULTITHREADED. Этот поток создан
         # голым threading.Thread, а не через механизм pywebview — то есть
@@ -249,28 +276,12 @@ class Api:
         # весь срок жизни потока, повторный вызов внутри while не нужен.
         ctypes.windll.ole32.CoInitializeEx(None, 0)
 
-        was_pressed_f4 = False
-        was_pressed_f5 = False
-        was_pressed_f6 = False
+        was_pressed_end = False
         while True:
-            is_pressed_f4 = _is_key_down(_HOTKEY_TOGGLE_VK)
-            is_pressed_f5 = _is_key_down(_HOTKEY_TOGGLE_VK_ALT)
-            is_pressed_f6 = _is_key_down(_HOTKEY_TEST_VK)
-
-            if is_pressed_f4 and not was_pressed_f4:
-                self._toggle_bot("F4")
-            if is_pressed_f5 and not was_pressed_f5:
-                self._toggle_bot("F5")
-            if is_pressed_f6 and not was_pressed_f6:
-                # test_rotation() сама проверяет "бот уже бежит?" и молча
-                # откажет (error: "bot_is_running"), если да — тут не нужно
-                # дублировать эту проверку, она уже центральная в одном месте.
-                logger.info("F6 (глобально): тест-прогон комбо.")
-                self.test_rotation()
-
-            was_pressed_f4 = is_pressed_f4
-            was_pressed_f5 = is_pressed_f5
-            was_pressed_f6 = is_pressed_f6
+            is_pressed_end = _is_key_down(_HOTKEY_TOGGLE_VK)
+            if is_pressed_end and not was_pressed_end:
+                self._toggle_bot("End")
+            was_pressed_end = is_pressed_end
             time.sleep(_HOTKEY_POLL_INTERVAL_SEC)
 
     # ------------------------------------------------------------------
@@ -302,14 +313,32 @@ class Api:
         # пользователя: это была заплатка от виртуального геймпада — клавиатуре
         # она не нужна, а скилл зря уходил в откат ещё до боя.)
 
+        # Кнопка "Старт" в программе: активно окно программы, и нажатия бота ушли бы ЕЙ, а не игре
+        # (лог друга 2026-10-11). Игру — вперёд, как у "Снять скилы". Зовём ДО запуска потока и пока
+        # окно программы ещё активно: Windows даёт сменить фокус только активному процессу.
+        # По End из игры она уже спереди — focus_game просто ничего не меняет.
+        try:
+            from src.core.game_window import focus_game
+            game_ok, game_why, _ = focus_game()
+            logger.info("start_bot: %s", game_why)
+        except Exception as e:                    # фокус — удобство, не повод не запускать бота
+            logger.warning("start_bot: не смог вывести игру вперёд: %s", e)
+
+        self._bot.pull_mode = self._farm_mode == "pull"   # режим из переключателя — на каждый Старт
+        logger.info("start_bot: режим фарма — %s", "пул (агр мобов)" if self._bot.pull_mode else "обычный")
         self._bot_thread = threading.Thread(
             target=self._bot.run, daemon=True, name="FarmBotLoop"
         )
         self._bot_thread.start()
+        self._shutdown_on_start()          # таймер "N минут" — отсчёт со старта
+
+        if self._chat_enabled:
+            self._chat_spawn()                # чат-бот — только если включён выключателем в интерфейсе
         logger.info("start_bot: бот запущен в фоновом потоке.")
         return {"ok": True}
 
-    def stop_bot(self) -> dict:
+    def stop_bot(self, reason: str = "user") -> dict:
+        """reason: "user" — кнопка Стоп / End, "timer" — сработал таймер выключения (для окна итога)."""
         if self._bot is None:
             return {"ok": True}
 
@@ -322,8 +351,366 @@ class Api:
         # долбить атаку уже после того, как пользователь решил, что бот
         # остановлен.
         self._bot.input_manager.halt_immediately()
+        self._shutdown_on_stop()
+        self._send_session_summary(reason if reason in ("user", "timer") else "user")
         logger.info("stop_bot: остановлен.")
         return {"ok": True}
+
+    # ------------------------------------------------------------------
+    # События в интерфейс, итог сессии
+    # ------------------------------------------------------------------
+
+    def _emit(self, name: str, detail: dict) -> None:
+        """CustomEvent в окне: интерфейс ловит window.addEventListener(name, e => e.detail).
+        json.dumps — и экранирование кавычек, и готовый JS-литерал объекта: строку руками не склеиваем."""
+        w = self._window
+        if w is None:
+            return
+        try:
+            w.evaluate_js("window.dispatchEvent(new CustomEvent(%s, {detail: %s}))"
+                          % (json.dumps(name), json.dumps(detail, ensure_ascii=False)))
+        except Exception:
+            logger.debug("событие %s не доставлено в окно", name, exc_info=True)
+
+    def _send_session_summary(self, reason: str) -> None:
+        """Один раз на сессию: Стоп может прийти дважды (кнопка + End/таймер) — окно не дублируем."""
+        bot = self._bot
+        ses = getattr(bot, "_session", None) if bot is not None else None
+        fn = getattr(bot, "session_stats", None)
+        if ses is None or fn is None or ses.get("start") == self._last_session_start:
+            return
+        stats = fn()
+        if stats is None:
+            return
+        stats["stop_reason"] = reason
+        self._last_session, self._last_session_start = stats, ses.get("start")
+        self._emit("easyfarm:session-summary", stats)
+
+    def get_last_session(self) -> dict | None:
+        """JS: итог последней сессии (тот же объект, что в событии easyfarm:session-summary) или null."""
+        return self._last_session
+
+    # ------------------------------------------------------------------
+    # Снимки готовых скиллов (кнопка "Снять скиллы")
+    # ------------------------------------------------------------------
+
+    _CAPTURE_SECONDS = 4.0          # столько снимаем панель: досиживающий откат скилл успеет выйти из него
+    _CAPTURE_MINIMIZE_WAIT_S = 1.0  # окно свернулось, игра перерисовалась — только потом снимаем
+
+    def capture_skills(self) -> dict:
+        """
+        JS: await window.pywebview.api.capture_skills() — ~6 с. Выводит окно игры вперёд
+        (src/core/game_window.py), сворачивает окно программы, находит панель по форме (любой
+        аккаунт и бинды — клавиши читаются с табличек), снимает её (src/core/vision/ready_capture.py),
+        разворачивает окно. Прогресс —
+        событием easyfarm:capture-progress. Бот подхватит снимки на следующем "Старт".
+        Ничего не нажимает — только смотрит на экран.
+        """
+        fail = {"ok": False, "preview_png": None, "slots": []}
+        if self._bot_running():
+            return dict(fail, message="Останови бота перед снимком скиллов")
+        if not self._capture_lock.acquire(blocking=False):
+            return dict(fail, message="Снимок уже идёт")
+        w = self._window
+        try:
+            # Логика снимка — в ядре (src/core/vision/ready_capture.py): та же у автоснимка при "Старт".
+            from src.core.vision.ready_capture import build_snapshots, grab_frames
+            from src.core.game_window import focus_game
+            total = int(self._CAPTURE_MINIMIZE_WAIT_S + self._CAPTURE_SECONDS + 1)
+            self._emit("easyfarm:capture-progress", {"stage": "minimize", "seconds_left": total})
+            # Сначала игру ВПЕРЁД, потом своё окно свернуть: Windows даёт сменить активное окно только
+            # активному процессу, а после сворачивания активными мы уже не будем.
+            game_ok, game_why, game_was_min = focus_game()
+            logger.info("Снимок скиллов: %s", game_why)
+            if w is not None:
+                w.minimize()
+            # Игра была свёрнута — ей нужно больше времени перерисоваться после разворота.
+            time.sleep(self._CAPTURE_MINIMIZE_WAIT_S + (0.5 if game_was_min else 0.0))
+            frames, bar, origin = grab_frames(
+                self._CAPTURE_SECONDS,
+                on_second=lambda n: self._emit("easyfarm:capture-progress", {"stage": "capture", "seconds_left": n}))
+            self._emit("easyfarm:capture-progress", {"stage": "save", "seconds_left": 0})
+            res = build_snapshots(frames, source="кнопка в программе", bar=bar, origin=origin)
+            if not res["ok"] and not game_ok:
+                res["message"] += " (%s)" % game_why     # подсказка, почему на экране не было игры
+            res.pop("preview_path", None)
+            res.pop("scale", None)
+            bad = [x["key"] for x in res.get("slots", []) if not x["ok"]]
+            logger.info("Снимок скиллов: %s%s", res["message"], (" (проверь: %s)" % " ".join(bad)) if bad else "")
+            return res
+        except Exception as e:
+            logger.exception("capture_skills упал")
+            return dict(fail, message="Ошибка снимка: %s" % e)
+        finally:
+            if w is not None:
+                try:
+                    w.restore()           # окно программы обратно — с результатом снимка
+                except Exception:
+                    pass
+            self._capture_lock.release()
+
+    # ------------------------------------------------------------------
+    # Чат-бот (выключатель в интерфейсе)
+    # ------------------------------------------------------------------
+
+    _FARM_MODES = ("pull", "normal")
+
+    def _initial_farm_mode(self) -> str:
+        """Переменная EZF_PULL (tools/pull_test.py, откат) важнее сохранённого выбора; иначе — из
+        ui_state.json; по умолчанию — пул."""
+        env = os.getenv("EZF_PULL")
+        if env in ("0", "1"):
+            return "pull" if env == "1" else "normal"
+        mode = self._load_ui_state().get("farm_mode", "pull")
+        return mode if mode in self._FARM_MODES else "pull"
+
+    def set_farm_mode(self, mode: str) -> dict:
+        """
+        JS: window.pywebview.api.set_farm_mode("pull" | "normal") — переключатель режима фарма.
+        Бот работает — режим сменится на следующем "Старт" (на ходу не переключаем: пул посреди
+        сбора бросил бы паровоз). Ответ: {"ok", "farm_mode", "applies": "now" | "next_start", "message"}.
+        """
+        if mode not in self._FARM_MODES:
+            return {"ok": False, "error": "bad_mode", "farm_mode": self._farm_mode}
+        self._farm_mode = mode
+        self._save_ui_state()
+        name = "агр мобов (пул)" if mode == "pull" else "обычный (бить всех без агра)"
+        later = self._bot_running()
+        logger.info("Режим фарма: %s%s", name, " — со следующего Старта" if later else "")
+        return {"ok": True, "farm_mode": mode, "applies": "next_start" if later else "now",
+                "message": "Режим: %s%s" % (name, " — включится после Стоп/Старт" if later else "")}
+
+    def get_farm_mode(self) -> dict:
+        """JS: window.pywebview.api.get_farm_mode() -> {"ok": True, "farm_mode": "pull" | "normal"}."""
+        return {"ok": True, "farm_mode": self._farm_mode}
+
+    def _load_ui_state(self) -> dict:
+        try:
+            with open(_UI_STATE_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _save_ui_state(self, **extra) -> None:
+        """Дописываем, а не перезаписываем: в файле живут и чат, и размер окна (window_size) —
+        запись одного не должна стирать другое."""
+        d = self._load_ui_state()
+        d["chat_enabled"] = self._chat_enabled
+        d["farm_mode"] = getattr(self, "_farm_mode", "pull")
+        d.update(extra)
+        try:
+            with open(_UI_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(d, f)
+        except OSError:
+            logger.warning("не смог сохранить %s", _UI_STATE_FILE)
+
+    def _chat_alive(self) -> bool:
+        return self._chat_thread is not None and self._chat_thread.is_alive()
+
+    def _chat_spawn(self) -> bool:
+        """Поднять поток чат-бота при работающем боте. Свой Event на каждый поток: stop_chat гасит
+        именно его, а новый старт не "оживит" поток, которому уже сказали выйти."""
+        if self._bot is None:
+            return False
+        old = self._chat_thread
+        if old is not None and old.is_alive():
+            if self._chat_stop is not None and not self._chat_stop.is_set():
+                return True                    # уже работает
+            old.join(timeout=2.0)              # прошлый ещё выходит (ждал ответ LLM) — не плодим два
+        try:
+            from tools.chat_bot_test import start_chat_thread
+            self._chat_stop = threading.Event()
+            self._chat_thread = start_chat_thread(self._bot, self._chat_stop)
+            logger.info("Чат-бот с ИИ запущен в фоне.")
+            return True
+        except Exception as e:
+            logger.exception("Не удалось запустить чат-бота")
+            gamepad_debug_logger.debug("CHAT    не запустился: %s", e)
+            return False
+
+    def start_chat(self) -> dict:
+        """JS: включить чат-бота. Бот работает — чат стартует сразу, нет — вместе со "Старт"."""
+        self._chat_enabled = True
+        self._save_ui_state()
+        if not self._bot_running():
+            return {"ok": True, "message": "Чат-бот включится вместе с ботом"}
+        if self._chat_spawn():
+            return {"ok": True, "message": "Чат-бот включён (распознавание текста грузится до минуты)"}
+        self._chat_enabled = False
+        self._save_ui_state()
+        return {"ok": False, "message": "Чат-бот не запустился — подробности в консоли"}
+
+    def stop_chat(self) -> dict:
+        """JS: выключить чат-бота (бот продолжает фармить)."""
+        self._chat_enabled = False
+        self._save_ui_state()
+        if self._chat_stop is not None:
+            self._chat_stop.set()
+        logger.info("Чат-бот выключен.")
+        return {"ok": True, "message": "Чат-бот выключен"}
+
+    # ------------------------------------------------------------------
+    # Таймер автоостановки (часики в интерфейсе)
+    # ------------------------------------------------------------------
+
+    def _load_shutdown_state(self) -> None:
+        try:
+            with open(_SHUTDOWN_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            return
+        mode = d.get("mode") or ("clock" if d.get("deadline") else None)
+        if mode == "duration" and float(d.get("armed_s") or 0) > 0:
+            self._shutdown_mode, self._shutdown_armed_s = "duration", float(d["armed_s"])
+            # Отсчёт не идёт: программа только открылась, бот ещё не запущен — начнётся со Старта.
+        elif mode == "clock" and float(d.get("deadline") or 0) > time.time():
+            self._shutdown_mode, self._shutdown_deadline = "clock", float(d["deadline"])
+
+    def _save_shutdown_state(self) -> None:
+        try:
+            if self._shutdown_mode is None:
+                if os.path.exists(_SHUTDOWN_FILE):
+                    os.remove(_SHUTDOWN_FILE)
+            else:
+                with open(_SHUTDOWN_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"mode": self._shutdown_mode, "armed_s": self._shutdown_armed_s,
+                               "deadline": self._shutdown_deadline}, f)
+        except Exception:
+            logger.exception("Таймер: не смог сохранить состояние в %s", _SHUTDOWN_FILE)
+
+    def _bot_running(self) -> bool:
+        return self._bot_thread is not None and self._bot_thread.is_alive() \
+            and bool(getattr(self._bot, "_running", False))
+
+    def _log_deadline(self, why: str) -> None:
+        d = self._shutdown_deadline
+        logger.info("Таймер: %s — бот остановится в %s.", why, time.strftime("%H:%M:%S", time.localtime(d)))
+        gamepad_debug_logger.debug("TIMER   %s — остановка в %s", why, time.strftime("%H:%M:%S", time.localtime(d)))
+
+    def set_shutdown_duration(self, minutes) -> dict:
+        """
+        JS: window.pywebview.api.set_shutdown_duration(60) — "бот работает 60 минут".
+        Отсчёт начинается при старте бота; если бот уже работает — с этой секунды.
+        """
+        try:
+            secs = float(minutes) * 60.0
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "bad_minutes"}
+        if not (60.0 <= secs <= 24 * 3600.0):
+            return {"ok": False, "error": "minutes_out_of_range"}
+        with self._shutdown_lock:
+            self._shutdown_mode, self._shutdown_armed_s = "duration", secs
+            self._shutdown_deadline = time.time() + secs if self._bot_running() else None
+            self._save_shutdown_state()
+        if self._shutdown_deadline is not None:
+            self._log_deadline("взведено на %.0f мин, бот уже работает" % (secs / 60))
+        else:
+            logger.info("Таймер: взведено на %.0f мин — отсчёт начнётся со Старта бота.", secs / 60)
+        return self.get_status()
+
+    def set_shutdown_timer(self, deadline_ms) -> dict:
+        """
+        JS: window.pywebview.api.set_shutdown_timer(ms) — "остановить в ЧЧ:ММ": момент остановки
+        (мс с 1970, как Date.now()), по часам, независимо от того, когда запущен бот.
+        """
+        try:
+            deadline = float(deadline_ms) / 1000.0
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "bad_deadline"}
+        if deadline <= time.time():
+            return {"ok": False, "error": "deadline_in_past"}
+        with self._shutdown_lock:
+            self._shutdown_mode, self._shutdown_armed_s, self._shutdown_deadline = "clock", None, deadline
+            self._save_shutdown_state()
+        self._log_deadline("по часам")
+        return self.get_status()
+
+    def cancel_shutdown_timer(self) -> dict:
+        """JS: window.pywebview.api.cancel_shutdown_timer() — снять таймер (оба режима)."""
+        with self._shutdown_lock:
+            had = self._shutdown_mode is not None
+            self._shutdown_mode = self._shutdown_armed_s = self._shutdown_deadline = None
+            self._save_shutdown_state()
+        if had:
+            logger.info("Таймер: отменён.")
+        return self.get_status()
+
+    def get_status(self) -> dict:
+        """
+        JS: опрашивать раз в 1-2 с.
+          running               — бот работает (в т.ч. запущен клавишей End);
+          shutdown_mode         — null | "duration" | "clock";
+          shutdown_minutes      — взведённые минуты (режим duration) или null;
+          shutdown_deadline_ms  — когда остановится (идёт отсчёт) или null (не идёт: бот не запущен);
+          chat_running          — выключатель "Чат-бот" включён (работает вместе с ботом).
+          farm_mode             — "pull" (агр мобов, бой у дома) | "normal" (бить всех без агра).
+          vision_warnings       — список строк-подсказок: бот чего-то не видит на экране (пусто — ок).
+        """
+        d = self._shutdown_deadline
+        a = self._shutdown_armed_s
+        return {"ok": True, "running": self._bot_running(), "shutdown_mode": self._shutdown_mode,
+                "shutdown_minutes": round(a / 60.0, 2) if a else None,
+                "shutdown_deadline_ms": int(d * 1000) if d else None,
+                "chat_running": bool(self._chat_enabled),
+                "farm_mode": self._farm_mode,
+                # Проверка зрения при старте (bot._vision_check_*): подсказки, что поправить, если бот
+                # не видит список целей / миникарту / панель HP. Пусто — всё в порядке.
+                "vision_warnings": list(getattr(self._bot, "vision_warnings", None) or []) + self._chat_warnings()}
+
+    @staticmethod
+    def _chat_warnings() -> "list[str]":
+        """Чат-бот не может отвечать (битый ключ, лимит) — подсказка в ту же плашку, что и зрение.
+        sys.modules.get: модуль чата грузится только при включении чата — не импортируем его ради статуса."""
+        cb = sys.modules.get("tools.chat_bot_test")
+        fn = getattr(cb, "llm_problem", None)
+        msg = fn() if callable(fn) else None
+        return [msg] if msg else []
+
+    def _shutdown_on_start(self) -> None:
+        """Бот стартовал: режим "N минут" — отсчёт пошёл с этой секунды."""
+        with self._shutdown_lock:
+            if self._shutdown_mode == "duration" and self._shutdown_armed_s:
+                self._shutdown_deadline = time.time() + self._shutdown_armed_s
+            else:
+                return
+        self._log_deadline("бот запущен, отсчёт %.0f мин пошёл" % (self._shutdown_armed_s / 60))
+
+    def _shutdown_on_stop(self) -> None:
+        """Бот остановлен: режим "N минут" — отсчёт снят (минуты остаются взведены до отмены)."""
+        with self._shutdown_lock:
+            if self._shutdown_mode == "duration":
+                self._shutdown_deadline = None
+
+    def _shutdown_watcher(self) -> None:
+        """Раз в 0.5 с: срок вышел -> стоп бота (как кнопка "Стоп") и событие в интерфейс."""
+        while True:
+            time.sleep(0.5)
+            with self._shutdown_lock:
+                d = self._shutdown_deadline
+                fire = d is not None and time.time() >= d
+                if fire:
+                    self._shutdown_deadline = None
+                    if self._shutdown_mode == "clock":
+                        self._shutdown_mode = None      # "в ЧЧ:ММ" — одноразовый
+                    self._save_shutdown_state()
+            if not fire:
+                continue
+            try:
+                self.stop_bot("timer")
+            except Exception:
+                logger.exception("Таймер: stop_bot упал")
+            stamp = time.strftime("%H:%M", time.localtime())
+            logger.info("Таймер: время вышло — бот остановлен в %s.", stamp)
+            gamepad_debug_logger.debug("TIMER   время вышло — бот остановлен")
+            w = self._window
+            if w is not None:
+                try:
+                    # Интерфейс ловит: window.addEventListener("easyfarm:shutdown-fired", e => ...)
+                    w.evaluate_js("window.dispatchEvent(new CustomEvent('easyfarm:shutdown-fired', "
+                                  "{detail: {time: '%s'}}))" % stamp)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Сохранение конфигурации из интерфейса
@@ -599,6 +986,35 @@ class Api:
             return {"ok": False, "error": str(e)}
 
 
+# Размер окна при первом запуске (логические пиксели), пока свой размер не запомнен.
+# 2026-10-11: высота 400 -> 420 (+20) по просьбе пользователя.
+_DEFAULT_WINDOW = (555, 420)
+_MIN_WINDOW = (420, 260)          # меньше — интерфейс не помещается; защита от "схлопнутого" окна
+
+
+def _window_size(state: dict) -> "tuple[int, int]":
+    """Размер окна из ui_state.json (последний, что был у пользователя), иначе по умолчанию.
+    Границы проверяем: файл могли испортить, или размер запомнили на большом мониторе, а запускают
+    на маленьком — тогда ужимаем до 95% экрана, чтобы заголовок окна не уехал за край.
+    Проверить без игры: положи в ui_state.json {"window_size": [5000, 10]} — окно откроется
+    шириной почти во весь экран и не ниже минимальной высоты."""
+    w, h = _DEFAULT_WINDOW
+    saved = state.get("window_size")
+    if isinstance(saved, (list, tuple)) and len(saved) == 2:
+        try:
+            w, h = int(saved[0]), int(saved[1])
+        except (TypeError, ValueError):
+            w, h = _DEFAULT_WINDOW
+    try:
+        u32 = ctypes.windll.user32
+        # Процесс DPI-aware (_set_dpi_aware): экран в физических пикселях, окно в логических.
+        # Логические <= физических, поэтому 95% физического экрана — безопасная верхняя граница.
+        max_w, max_h = int(u32.GetSystemMetrics(0) * 0.95), int(u32.GetSystemMetrics(1) * 0.95)
+    except Exception:                    # не Windows (тесты) — без верхней границы
+        max_w = max_h = 10**5
+    return min(max(w, _MIN_WINDOW[0]), max_w), min(max(h, _MIN_WINDOW[1]), max_h)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
@@ -624,13 +1040,25 @@ def main() -> None:
     _sync_icons_to_dist()
 
     api = Api()
+    width, height = _window_size(api._load_ui_state())
     window = webview.create_window(
         "EasyFarm — Throne and Liberty",
         _DIST_INDEX,
         js_api=api,
-        width=530,
-        height=320,
+        width=width,
+        height=height,
     )
+    # Окно запоминает свой размер: потянул мышкой за край — при следующем запуске такое же.
+    # resized приходит десятки раз за одно перетаскивание, поэтому здесь только запоминаем число
+    # в памяти (дёшево), а на диск пишем один раз — при закрытии окна (_on_closed ниже).
+    # pywebview отдаёт размер в логических пикселях — тех же, что принимает create_window,
+    # так что на экране с масштабом 125-150% окно не "растёт" от запуска к запуску.
+    last_size = {"w": width, "h": height}
+
+    def _on_resized(w, h):
+        last_size["w"], last_size["h"] = int(w), int(h)
+
+    window.events.resized += _on_resized
 
     # os._exit() — жёсткий выход из процесса в обход обычной Python-очистки
     # (atexit, сборщик мусора). Нужен именно он, а не полагаться на то, что
@@ -643,7 +1071,14 @@ def main() -> None:
     # закрывали — та же дыра). Терять на жёстком выходе нечего: save_config/
     # save_icon уже пишут на диск сразу по действию пользователя, а не
     # "на закрытии" — дописывать в момент выхода нечего.
-    window.events.closed += lambda: os._exit(0)
+    def _on_closed():
+        try:
+            api._save_ui_state(window_size=[last_size["w"], last_size["h"]])
+        finally:
+            os._exit(0)            # try/finally: даже если запись упала, процесс всё равно закроется
+
+    window.events.closed += _on_closed
+    api._window = window          # таймер автоостановки шлёт в интерфейс событие "сработал"
 
     # private_mode=False пробовали — окно вообще переставало отрисовываться
     # и принимать клики, без единой ошибки в консоли (похоже на сбой

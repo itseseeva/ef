@@ -1,0 +1,40 @@
+                and missing_for_s < self._TARGET_LOST_GRACE_S + self._LOST_HOLD_S
+            ):
+                # ОХРАННИК: на убийство не похоже (HP не падало быстро) -> это может
+                # быть моргание панели на живой цели. Tab сейчас увёл бы нас с
+                # недобитого моба, поэтому ничего не нажимаем и ждём возвращения.
+                if not self._lost_hold_logged:
+                    self._lost_hold_logged = True
+                    gamepad_debug_logger.debug(
+                        "HOLD    панель пропала %.2fс, HP было %.1f%% (скорость %.1f п.п./с, прогноз %.1f%%) — "
+                        "на убийство не похоже, Tab НЕ жму, жду возвращения до %.1fс",
+                        missing_for_s, last_hp, rate, projected,
+                        self._TARGET_LOST_GRACE_S + self._LOST_HOLD_S,
+                    )
+                return
+            if killed:
+                logger.info("COMBAT -> SEARCH: цель пропала (убита), лут автоматический.")
+                if getattr(self, "navigator", None) is not None:
+                    self.navigator.set_anchor()   # мобы спавнятся тут — прогулка (если понадобится) вокруг этого места
+            else:
+                logger.info(
+                    "COMBAT -> SEARCH: цель ПОТЕРЯНА, не убита (HP было %.0f%%, прогноз %.0f%%) — ищу её же.",
+                    last_hp, projected,
+                )
+            # Та же причина, что и у STATE-строки в _handle_search() выше —
+            # но здесь ЕЩЁ важнее: именно это место чистит очередь ротации
+            # (cancel_pending_actions() ниже), и единственный способ отличить
+            # в логе "обвал цепочки из-за настоящей пропажи панели" от
+            # "это SEARCH сам по себе спамит тот же физический комбо" —
+            # увидеть ИМЕННО эту строку с реальной длительностью пропажи.
+            gamepad_debug_logger.debug(
+                "STATE   COMBAT -> SEARCH (панель отсутствовала %.2fс подряд, "
+                "грейс-период %.2fс; последнее HP %.1f%%, скорость %.1f п.п./с, прогноз %.1f%% -> %s) "
+                "-> cancel_pending_actions()",
+                missing_for_s, grace_s, last_hp, rate, projected,
+                "УБИТА" if killed else "ПОТЕРЯНА",
+            )
+            self._bb_event(now, "lost_verdict", {
+                "verdict": "killed" if killed else "lost",
+                "last_hp": last_hp, "rate": rate, "projected": projected,
+                "missing_for_s": missing_for_s,

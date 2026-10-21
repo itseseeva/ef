@@ -1,0 +1,10 @@
+10:02:02.351  === COMBO END ===
+10:02:02.374  VISION  panel: found=False (цели нет)  |  aim: found=True
+10:02:03.159  STATE   COMBAT -> SEARCH (панель отсутствовала 1.02с подряд, грейс-период 1.00с) -> cancel_pending_actions()
+10:02:03.181  AIM     цель в дедзоне/потеряна -> ухожу в покой
+10:02:03.391  VISION  panel: found=False (цели нет)  |  aim: found=True
+10:02:03.433  STATE   SEARCH -> COMBAT (панель нашла цель)
+10:02:03.434  === COMBO START ['press_target'] ===
+10:02:03.434  PRESS   кнопка target (down)
+10:02:03.434          (держим target 71 мс)
+10:02:03.458  AIM     цель вне дедзоны -> начинаю слежение dx=+99.5 dy=-121.5

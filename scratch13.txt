@@ -1,0 +1,25 @@
+            if not mixed:
+                res = _check_candidate(frame, dark[yt], dark[yb], yt, yb, w, h)
+            else:
+                # Длину и концы рамки меряем по ЧЁРНОЙ линии; тусклая должна покрыть её почти
+                # всю (FRAME_DIM_COVER_MIN), но может прерываться: между табличками "Wooly" и
+                # "DAD" в линии светлый просвет 8 px.
+                main, other = (dark[yt], dim[yb]) if yt in strict else (dark[yb], dim[yt])
+                res = _check_candidate(frame, main, other, yt, yb, w, h, other_cover_min=T.FRAME_DIM_COVER_MIN)
+            if res.ok:
+                return res
+            last_reason = res.reason
+    return _fail(last_reason)
+
+
+def _check_candidate(frame: np.ndarray, line_a: np.ndarray, line_b: np.ndarray,
+                     yt: int, yb: int, w: int, h: int,
+                     other_cover_min: "float | None" = None) -> PanelResult:
+    """
+    Проверяет ОДНУ пару чёрных линий (yt — верхняя, yb — нижняя). line_a/line_b — маски
+    тёмного этих строк. other_cover_min=None: общий участок обеих линий (как всегда).
+    Иначе line_a — настоящая чёрная (по ней концы рамки), line_b — тусклая, ей достаточно
+    покрыть other_cover_min длины (см. read_panel, таблички других игроков поверх панели).
+    """
+    both = line_a & line_b if other_cover_min is None else line_a
+    group = _trim_edge_runs(_longest_group(np.flatnonzero(both), T.FRAME_LINE_MAX_GAP),

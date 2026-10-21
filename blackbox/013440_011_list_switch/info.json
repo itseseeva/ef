@@ -1,0 +1,14 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": true,
+ "since_entry_s": 14.76,
+ "chain": null,
+ "panel_found": true,
+ "hp": 92.14,
+ "txt": "HpText(sig=997d5a95, ink=214, 10x98)",
+ "waited_s": 14.764999999897555,
+ "why": "раненый №2 (HP 33%, 14 м) висит в списке, а наша цель 92% — добиваю его",
+ "list": "1:14м*(17%) 2:14м(32%) 3:27м 4:29м 5:25м~(38%) 6:42м",
+ "event": "list_switch"
+}

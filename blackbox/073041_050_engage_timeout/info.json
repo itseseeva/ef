@@ -1,0 +1,13 @@
+{
+ "state": "COMBAT",
+ "phase": "TAB",
+ "engaged": false,
+ "since_entry_s": 0.02,
+ "chain": null,
+ "panel_found": true,
+ "hp": 97.84,
+ "txt": "HpText(sig=1e1fddc0, ink=184, 10x98)",
+ "waited_s": 0.01600000006146729,
+ "retabs": 0,
+ "event": "engage_timeout"
+}

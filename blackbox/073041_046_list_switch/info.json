@@ -1,0 +1,14 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": true,
+ "since_entry_s": 5.83,
+ "chain": null,
+ "panel_found": true,
+ "hp": 0.71,
+ "txt": "HpText(sig=c9aff262, ink=119, 10x98)",
+ "waited_s": 5.827999999979511,
+ "why": "чужой моб: серая полоска HP 1% (его бьёт другой игрок)",
+ "list": "3:10мX 4:37м",
+ "event": "list_switch"
+}

@@ -1,0 +1,20 @@
+
+    # --- 4) Кнопка X ------------------------------------------------------
+    px0 = x_right + T.PLATE_DX_FROM
+    px1 = min(x_right + T.PLATE_DX_TO + 1, w)
+    plate_checked = (px1 - px0) >= T.PLATE_MIN_COLUMNS
+    if plate_checked:
+        plate = frame[yt + T.PLATE_DY_FROM: yt + T.PLATE_DY_TO + 1, px0:px1].astype(np.int16)
+        b, g, r = plate[..., 0], plate[..., 1], plate[..., 2]
+        gb = np.maximum(g, b)
+        crimson = (
+            (r >= T.PLATE_R_MIN) & (r <= T.PLATE_R_MAX)
+            & (gb <= T.PLATE_GB_MAX) & (r >= gb * T.PLATE_R_OVER_GB)
+        )
+        if crimson.mean() < T.PLATE_CRIMSON_MIN:
+            return _fail("нет малиновой плашки кнопки X")
+        glyph = np.minimum(np.minimum(b, g), r) >= T.PLATE_GLYPH_MIN_CHANNEL
+        if np.count_nonzero(glyph) < T.PLATE_GLYPH_MIN_PIXELS:
+            return _fail("нет крестика на кнопке X")
+    elif weak_bottom:
+        return _fail("нет бежевой окантовки снизу")    # низ закрыт, а кнопку X не проверить — не рискуем

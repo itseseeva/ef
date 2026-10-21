@@ -1,0 +1,20 @@
+    x_left, x_right = int(group[0]), int(group[-1])
+    span = x_right - x_left + 1
+    if not (T.FRAME_SPAN_MIN <= span <= T.FRAME_SPAN_MAX):
+        return _fail("длина линий %d px вне диапазона" % span)
+    if group.size < span * T.FRAME_LINE_FILL_MIN:
+        return _fail("линии рамки с большими разрывами")
+    if other_cover_min is not None and line_b[x_left:x_right + 1].mean() < other_cover_min:
+        return _fail("вторая линия рамки закрыта больше чем на %d%%" % round((1 - other_cover_min) * 100))
+
+    # --- 2) Правая вертикальная граница рамки ----------------------------
+    # Ищем самый тёмный столбец в 0..FRAME_EDGE_SEARCH_PX правее конца линий: у новой
+    # панели (2026-10-04) граница на 1 px дальше и светлее порога линий (29-34 против 24).
+    edge_best = 0.0
+    for c in range(x_right, min(w, x_right + T.FRAME_EDGE_SEARCH_PX + 1)):
+        col = frame[yt:yb + 1, c].max(axis=1) <= T.FRAME_EDGE_DARK_MAX
+        edge_best = max(edge_best, float(col.mean()))
+    if edge_best < T.FRAME_RIGHT_EDGE_MIN:
+        return _fail("нет правой границы рамки")
+
+    # --- 3) Бежевая окантовка сверху и снизу ------------------------------

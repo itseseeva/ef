@@ -1,0 +1,20 @@
+        ):
+            # ОХРАННИК: HP не выросло (с допуском на шум полоски) -> это ТА ЖЕ цель,
+            # просто панель моргнула; захват и ПКМ по прицелу не трогаем (в толпе
+            # они могли бы выбрать другого моба). Выросло -> игра дала другого.
+            same_target = (
+                self._GUARD_ENABLED
+                and self._engaged
+                and bool(self._hp_hist)
+                and panel_info.hp_percent <= self._hp_hist[-1][1] + self._CONTINUITY_TOL_PCT
+            )
+            if same_target:
+                gamepad_debug_logger.debug(
+                    "HOLD    панель вернулась через %.2fс, HP %.1f%% -> %.1f%%: та же цель, захват не трогаю",
+                    now - lost_since, self._hp_hist[-1][1], panel_info.hp_percent,
+                )
+                self._bb_event(now, "hold_resolved", {
+                    "gap_s": now - lost_since, "hp_before": self._hp_hist[-1][1],
+                    "hp_after": panel_info.hp_percent,
+                })
+            else:

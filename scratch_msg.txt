@@ -1,0 +1,10 @@
+class ChatMessage:
+    channel: str
+    sender: "str | None"      # None — заголовок не попал в зону (ушёл вверх)
+    text: str
+    time: str                 # "20:46"
+    header_y: "tuple[int, int] | None" = None   # полоса заголовка (ник + треугольник "ответить") в зоне
+
+    @property
+    def key(self) -> tuple:
+        # Без времени: в закрытом чате его нет. Повтор того же текста отличаем по тому, что

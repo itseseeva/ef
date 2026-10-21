@@ -1,0 +1,12 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": false,
+ "since_entry_s": 0.0,
+ "chain": "1 (доигрываю)",
+ "panel_found": true,
+ "hp": 96.4,
+ "txt": "HpText(sig=7913186d, ink=189, 10x98)",
+ "why": "hp 10% -> 96%",
+ "event": "swap_relock"
+}

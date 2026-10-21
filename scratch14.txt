@@ -1,0 +1,21 @@
+    def _lost_grace_s(self) -> float:
+        """
+        Сколько ждать возвращения пропавшей панели (см. _FAST_KILL_*). Последний
+        замер HP — из _hp_hist (пишется раз в 0.1 с, пока панель видна), поэтому
+        он не старше 0.1 с до пропажи. Отрицательное HP = "не знаем" -> обычный грейс.
+        """
+        # Список целей: строка ещё выбрана -> панель просто моргнула (свечение, эффекты),
+        # ждём дольше обычного. А вот "строки нет" — НЕ смерть (лог 2026-10-04 12:26-12:28):
+        # моб, с которым идёт бой, пропадает из списка "Астрального зрения" в момент
+        # первого удара. Раньше это читалось как "умер" (грейс 0.3 с), и любое моргание
+        # панели бросало живого моба — главная причина "бот не добивает".
+        hist = self._hp_hist
+        low_hp = bool(hist) and 0.0 <= hist[-1][1] <= self._FAST_KILL_MAX_HP
+        tl = getattr(self, "_list_last", None) if self._LIST_TARGETING else None
+        if tl is not None and tl.visible and tl.selected_row is not None and getattr(self, "_list_saw_selected", False):
+            return self._FAST_KILL_GRACE_S if low_hp else self._LIST_ALIVE_GRACE_S
+        if low_hp:
+            return self._FAST_KILL_GRACE_S
+        return self._TARGET_LOST_GRACE_S
+
+    def _record_hp(self, now: float, hp: float) -> None:

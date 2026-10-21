@@ -1,0 +1,14 @@
+{
+ "state": "COMBAT",
+ "phase": "TAB",
+ "engaged": false,
+ "since_entry_s": 0.12,
+ "chain": null,
+ "panel_found": true,
+ "hp": 97.12,
+ "txt": "HpText(sig=4654e7b1, ink=204, 10x98)",
+ "waited_s": 0.125,
+ "why": "HP не менялось",
+ "list": "1:16м 2:8м 3:18м(83%) 4:31м*",
+ "event": "list_switch"
+}

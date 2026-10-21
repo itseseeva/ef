@@ -1,0 +1,13 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": true,
+ "since_entry_s": 1.5,
+ "chain": null,
+ "panel_found": true,
+ "hp": 99.28,
+ "txt": "HpText(sig=493bdc5d, ink=187, 10x98)",
+ "waited_s": 1.5,
+ "retabs": 0,
+ "event": "engage_timeout"
+}

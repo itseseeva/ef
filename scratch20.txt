@@ -1,0 +1,7 @@
+2084: if not self._try_list_switch(now):
+2105: return self._try_list_switch(now, why="цель посерела")
+2145: return self._try_list_switch(now, why="ближе другая цель", blacklist=False)
+2492: def _try_list_switch(self, now: float, why: str = "HP не менялось", blacklist: bool = True) -> bool:
+3020: if self._try_list_switch(now):
+4106: if not self._try_list_switch(now, why="E не срабатывает"):
+4208: if self._try_list_switch(now, why="игра выбрала дальнюю", blacklist=False):

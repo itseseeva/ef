@@ -57,6 +57,7 @@ class MinimapOdometry:
         self.response = 0.0
         self._lost = 0
         self.history: "deque[tuple[float, float, float]]" = deque()   # (t, x, y)
+        self.last_prepared: "np.ndarray | None" = None   # последний подготовленный кадр (для сверки с домом)
         self._history_s = history_s
 
     def _window(self, h: int, w: int) -> np.ndarray:
@@ -79,6 +80,7 @@ class MinimapOdometry:
             self.ok = False
             return False
         cur = self._prepare(frame_bgr)
+        self.last_prepared = cur
         if self._key is None:
             self._key, self._key_pos = cur, self.pos.copy()
             self.ok = True
@@ -102,6 +104,28 @@ class MinimapOdometry:
         self.ok = True
         self._remember(now)
         return True
+
+    def relocate(self, snapshot: np.ndarray, snap_pos: "tuple[float, float]",
+                 min_response: float) -> "tuple[float, float, float] | None":
+        """
+        Сверка с сохранённым кадром места (дом): где мы ОТНОСИТЕЛЬНО него, без накопленной ошибки
+        одометра. Та же фазовая корреляция, что у одометра, только опорный кадр — снимок дома,
+        а не прошлый кадр. Удалось (уверенность >= min_response) — позиция и опорный кадр
+        переставляются на найденное место, возвращаем (dx, dy, уверенность) — на сколько поправили.
+        Замер на кадрах игры (2026-10-12): до 40 px от дома уверенность 0.31-0.75 и совпадение с
+        одометром +-3 px; чужое место — 0.00-0.08.
+        """
+        cur = self.last_prepared
+        if cur is None or snapshot is None or cur.shape != snapshot.shape:
+            return None
+        (sx, sy), resp = cv2.phaseCorrelate(snapshot, cur)
+        if resp < min_response:
+            return None
+        new = np.array([snap_pos[0] - sx, snap_pos[1] - sy])
+        dx, dy = new - self.pos
+        self.pos = new
+        self._key, self._key_pos, self._lost = cur, new.copy(), 0
+        return float(dx), float(dy), float(resp)
 
     def _remember(self, now: float) -> None:
         self.history.append((now, float(self.pos[0]), float(self.pos[1])))

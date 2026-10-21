@@ -72,6 +72,7 @@ _TURN_DY_SCALE = 0.3
 _TURN_MAX_SCALE = 1.8
 _TURN_PAUSE_S = (0.06, 0.16)
 _MIRROR = {"a": "d", "d": "a"}
+RUN_MAX_SIDE_FRAC = 0.33        # прогулка: вбок не больше трети от бега вперёд
 _BACK_SPEED = 0.7               # S обычно медленнее W (так же считает build_movement_model)
 
 
@@ -91,6 +92,62 @@ class Phrase:
         """A<->D: та же фраза в другую сторону — разнообразие x2 без новых записей."""
         steps = tuple((t, frozenset(_MIRROR.get(k, k) for k in st)) for t, st in self.steps)
         return Phrase(self.id, self.dur, steps, self.fwd, -self.side, self.combat_ok, self.back, not self.mirrored)
+
+
+PHRASE_MAX_TAIL_S = 0.10        # ТУРБО 2026-10-05: "стоять" в конце фразы не дольше (было до 0.85 с)
+
+
+def _trim_tail(ph: "Phrase") -> "Phrase":
+    """
+    Фраза кончается отпусканием всех клавиш, а у части записей после него ещё до 0.85 с
+    тишины — между фразами персонаж замирал. Хвост режем до PHRASE_MAX_TAIL_S: следующая
+    фраза начинается сразу. Внутренние паузы не трогаем — они часть "почерка" игрока.
+    """
+    if not ph.steps or ph.steps[-1][1]:
+        return ph
+    t_last = ph.steps[-1][0]
+    if ph.dur - t_last <= PHRASE_MAX_TAIL_S:
+        return ph
+    return Phrase(ph.id, t_last + PHRASE_MAX_TAIL_S, ph.steps, ph.fwd, ph.side, ph.combat_ok, ph.back, ph.mirrored)
+
+
+def _has_jump(ph: "Phrase") -> bool:
+    """Есть ли во фразе прыжок (пробел зажат хоть на одном шаге)."""
+    return any("space" in keys for _, keys in ph.steps)
+
+
+# Прыжки в стрейфах (просьба 2026-10-05: "20-30% стрейфов с прыжками"). В записях игрока
+# боевых фраз с прыжком нет (все 160 фраз с пробелом — длинные пробежки), поэтому прыжок
+# вставляем в саму фразу стрейфа: в случайный момент, пока зажата A или D, на время из
+# почерка игрока (hold_stats["space"]: p10-p90 = 0.14-0.22 с). Доля — случайная на каждую
+# фразу в пределах JUMP_STRAFE_P, режимы — бой и поиск между целями (не выбор цели: там из
+# фразы берём только A/D, и не прогулка/подход).
+JUMP_STRAFE_P = (0.20, 0.30)
+_JUMP_MODES = frozenset({MODE_COMBAT, MODE_SEARCH})
+_JUMP_HOLD_FALLBACK_S = (0.14, 0.22)
+_JUMP_MIN_SPAN_S = 0.25          # стрейф короче — прыжок в него не помещается по-человечески
+
+
+def with_jump(ph: "Phrase", rng: "random.Random", hold_s: "tuple[float, float]") -> "Phrase":
+    """
+    Та же фраза, но с одним прыжком посреди стрейфа (A/D зажата не меньше _JUMP_MIN_SPAN_S).
+    Стрейфа нет — фраза как есть. Чистая функция (rng снаружи) — гоняется в тестах.
+    """
+    spans = []
+    for i, (t, keys) in enumerate(ph.steps):
+        t_next = ph.steps[i + 1][0] if i + 1 < len(ph.steps) else ph.dur
+        if keys & {"a", "d"} and "space" not in keys and t_next - t >= _JUMP_MIN_SPAN_S:
+            spans.append((i, t, t_next, keys))
+    if not spans:
+        return ph
+    i, t0, t1, keys = rng.choice(spans)
+    hold = rng.uniform(*hold_s)
+    lo, hi = t0 + 0.04, max(t0 + 0.04, t1 - hold - 0.03)
+    tj = rng.uniform(lo, hi)
+    t_up = min(tj + hold, t1 - 0.01)
+    steps = list(ph.steps)
+    steps[i + 1:i + 1] = [(tj, keys | {"space"}), (t_up, keys)]
+    return Phrase(ph.id, ph.dur, tuple(steps), ph.fwd, ph.side, ph.combat_ok, ph.back, ph.mirrored)
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,12 +229,40 @@ class MovementController:
                  rng: "random.Random | None" = None, clock=time.monotonic,
                  turns: "list[Turn] | None" = None, hold_stats: "dict | None" = None) -> None:
         self._im = input_manager
+        phrases = [_trim_tail(p) for p in phrases]
         self._all = phrases
         self._turns = [t for t in (turns or []) if abs(t.dx) >= 1]
         self._hold_stats = hold_stats or {}
         self._combat = [p for p in phrases if p.combat_ok] or phrases
+        # Прогулка = "просто бежит" (жалоба 2026-10-05: "не просто бежит, а стрейфится и прыгает"):
+        # только фразы без прыжков, где бег вперёд главный, а вбок — не больше трети от него.
+        # Прыжок остался только в выходе из застревания (unstuck). Таких фраз нет — как раньше.
+        # Выбор цели (MODE_SELECT, из фразы берём только A/D): нужны фразы, которые СРАЗУ
+        # начинаются со стрейфа — выбор длится 0.2-0.4 с, а фраза "сначала W, потом W+A" после
+        # маски A/D давала пустоту: персонаж вставал, пока жал F+E (жалоба 2026-10-05).
+        self._strafe_pool = [p for p in self._combat if p.steps and p.steps[0][1] & {"a", "d"}] or self._combat
+        # Бой: без шагов НАЗАД (просьба 2026-10-06): пятясь, бот выходил из дальности скиллов
+        # (15 м), и скилл не нажимался. Только W/A/D: вбок и к цели — камера смотрит на моба.
+        self._combat_fwd = [p for p in self._combat if not any("s" in k for _, k in p.steps)] or self._combat
+        # Назад можно, только когда цель близко (<= 10 м, просьба 2026-10-06): решает бот по метрам
+        # списка (set_back_allowed). По умолчанию нельзя — метры неизвестны, рисковать дальностью не будем.
+        self._back_allowed = False
+        # Сместиться назад ПРИОРИТЕТНО (камера упёрлась в низ коридора наклона, моб под прицелом).
+        self._back_bias = False
+        # Бежать ВПЕРЁД, к цели (бот: цель дальше дальности скиллов, автобег не идёт, цель в кадре
+        # у центра — камера смотрит на неё, значит W ведёт к ней). 2026-10-06 "всегда в движении".
+        self._fwd_bias = False
+        self._run_pool = [p for p in phrases if not _has_jump(p) and p.fwd > 0.3
+                     and abs(p.side) <= RUN_MAX_SIDE_FRAC * p.fwd and p.back <= 0.05] or phrases
         self.t = tuning or MoveTuning()
         self._rng = rng or random.Random()
+        sp = self._hold_stats.get("space") or {}
+        self._jump_hold_s = ((float(sp["p10"]), float(sp["p90"])) if sp.get("p10") and sp.get("p90")
+                             and 0.05 <= float(sp["p10"]) < float(sp["p90"]) <= 0.6 else _JUMP_HOLD_FALLBACK_S)
+        self.strafes_played = 0
+        self.jumps_played = 0
+        self.jumps_skipped = 0
+        self._jump_skip_logged = False
         self._clock = clock
         self._mode = MODE_OFF
         self._wake = threading.Event()
@@ -226,6 +311,26 @@ class MovementController:
     @property
     def mode(self) -> str:
         return self._mode
+
+    def set_fwd_bias(self, on: bool) -> None:
+        """Предпочитать фразы с бегом вперёд (W) — сближение с целью без автобега игры."""
+        self._fwd_bias = bool(on)
+
+    def set_back_bias(self, on: bool) -> None:
+        """Предпочитать фразы с шагом назад (только вместе с set_back_allowed(True))."""
+        self._back_bias = bool(on)
+
+    def set_home_bias(self, vec: "tuple[float, float] | None") -> None:
+        """
+        Режим пул, добивание (2026-10-13): куда дом относительно камеры — (вперёд, вбок вправо),
+        единичный вектор, или None. В бою предпочитаем фразы, которые смещают к дому: бот дерётся
+        и по пути плавно идёт к людям (живые шаги из записи, а не "стоит столбом" и не бег без боя).
+        """
+        self._home_bias = vec
+
+    def set_back_allowed(self, on: bool) -> None:
+        """Можно ли в бою шагать назад (S). Зовётся каждый тик бота; bool присваивается атомарно."""
+        self._back_allowed = bool(on)
 
     def set_sprint(self, on: bool) -> None:
         """Режим approach: держать Shift (цель далеко). Зовётся каждый тик FSM — дёшево."""
@@ -343,14 +448,38 @@ class MovementController:
         if self._cur is not None and (self._cur_mode != mode or now >= self._phrase_end()):
             self._cur = None
         if self._cur is None:
-            self._begin(self._choose(mode), mode, now)
+            ph = self._choose(mode)
+            jumped = False
+            if mode in _JUMP_MODES and ph.steps and any(k & {"a", "d"} for _, k in ph.steps):
+                self.strafes_played += 1
+                if self._rng.random() < self._rng.uniform(*JUMP_STRAFE_P):
+                    jph = with_jump(ph, self._rng, self._jump_hold_s)
+                    jumped = jph is not ph
+                    ph = jph
+                    self.jumps_played += jumped
+            self._begin(ph, mode, now, jumped=jumped)
         k, next_t = self._state_at(now)
         allowed = _MODE_KEYS.get(mode)
         if allowed is not None:
             k = k & allowed                       # select: из фразы берём только стрейфы
+        if mode == MODE_COMBAT and not self._back_allowed:
+            k = k - {"s"}                         # цель дальше 10 м (или метры неизвестны): назад не шагаем,
+                                                  # даже если фраза с S уже играет — отошли бы из дальности скиллов
+        if "space" in k and "space" not in self._pressed and not self._jump_ok():
+            k = k - {"space"}                     # скилл жмётся/в очереди — прыжок пропускаем (не "съест" скилл)
+            if not self._jump_skip_logged:
+                self._jump_skip_logged = True
+                self.jumps_skipped += 1
+                input_debug_logger.debug("MOVE    прыжок пропущен: рядом нажатие скилла")
+        if mode == MODE_ROAM and "w" in k and self._sprint_now(now):
+            k = k | {"shift"}                     # поход домой (bot: set_sprint) — бег вперёд в шифте
         self._apply(k)
         turn_next = self._step_turn(now)
         return min(next_t, turn_next, now + self.t.idle_poll_s)
+
+    def _jump_ok(self) -> bool:
+        fn = getattr(type(self._im), "jump_allowed", None)
+        return fn(self._im) if callable(fn) else True
 
     def _sprint_now(self, now: float) -> bool:
         if not self._sprint:
@@ -364,14 +493,27 @@ class MovementController:
         # Поиск между целями — те же мелкие боевые шаги (2026-10-04): раньше бот бегал
         # длинными фразами и убегал от места, где через долю секунды кликал новую цель.
         small = mode in (MODE_COMBAT, MODE_SEARCH, MODE_SELECT)
-        pool = self._combat if small else self._all
+        if mode == MODE_COMBAT:
+            pool = self._combat if self._back_allowed else self._combat_fwd
+        else:
+            pool = self._strafe_pool if mode == MODE_SELECT else (self._combat if small else self._run_pool)
         radius = self.t.combat_radius_s if small else self.t.search_radius_s
         best, best_cost = None, float("inf")
         for _ in range(min(self.t.candidates, len(pool))):
             ph = self._rng.choice(pool)
             if self._rng.random() < self.t.mirror_p:
                 ph = ph.mirror()
-            if mode == MODE_ROAM:
+            hb = getattr(self, "_home_bias", None)
+            if mode == MODE_COMBAT and hb is not None:
+                # К дому: чем больше фраза смещает в сторону дома — тем дешевле; от дома — дорого.
+                # Своего "поводка фразы" тут нет: место знает одометр, а держит его бот (поводок дома).
+                toward = ph.fwd * hb[0] + ph.side * hb[1] - ph.back * hb[0]
+                cost = (-3.0 * toward + 0.3 * abs(ph.side)) / max(ph.dur, 0.3)
+            elif mode == MODE_COMBAT and self._fwd_bias:
+                # Сближение: вперёд главное, вбок можно (живее), назад — дорого. Поводка нет —
+                # мы и хотим уйти с места к цели.
+                cost = (-2.0 * ph.fwd + 0.6 * abs(ph.side) + 5.0 * ph.back) / max(ph.dur, 0.3)
+            elif mode == MODE_ROAM:
                 # Прогулка: бежим ВПЕРЁД (куда — решает камера), стрейфы и шаги назад — редко.
                 # Поводка здесь нет: место знает одометр миникарты, а не счёт клавиш.
                 cost = (-1.5 * ph.fwd + 0.8 * abs(ph.side) + 2.0 * ph.back) / max(ph.dur, 0.3)
@@ -379,7 +521,9 @@ class MovementController:
                 f, s = self.pos_fwd + ph.fwd, self.pos_side + ph.side
                 r = math.hypot(f, s)
                 cost = 10.0 * max(0.0, r - radius) ** 2           # выходит за поводок — дорого
-                if small and f < self.t.combat_min_fwd_s:
+                if mode == MODE_COMBAT and self._back_bias and self._back_allowed:
+                    cost += 4.0 * max(0.0, ph.fwd) - 4.0 * ph.back     # нужен шаг назад — он и дешевле
+                elif small and f < self.t.combat_min_fwd_s:
                     cost += 10.0 * (self.t.combat_min_fwd_s - f) ** 2   # пятится от моба — дорого
             cost += self.t.match_cost * len(ph.steps[0][1] ^ self._pressed)
             if ph.id in self._recent:
@@ -389,17 +533,18 @@ class MovementController:
                 best, best_cost = ph, cost
         return best
 
-    def _begin(self, ph: Phrase, mode: str, now: float, remember: bool = True) -> None:
+    def _begin(self, ph: Phrase, mode: str, now: float, remember: bool = True, jumped: bool = False) -> None:
         self._cur, self._cur_mode, self._cur_t0 = ph, mode, now
+        self._jump_skip_logged = False
         self._cur_tempo = self._rng.uniform(*self.t.tempo) if remember else 1.0
         if not remember:
             return
         self._recent.append(ph.id)
         self.phrases_played += 1
-        input_debug_logger.debug("MOVE    %s фраза #%d%s %.1f с | позиция вперёд %+.1f вбок %+.1f",
+        input_debug_logger.debug("MOVE    %s фраза #%d%s%s %.1f с | позиция вперёд %+.1f вбок %+.1f",
                                  {MODE_COMBAT: "бой", MODE_ROAM: "прогулка"}.get(mode, "поиск"), ph.id,
-                                 " (зерк.)" if ph.mirrored else "", ph.dur * self._cur_tempo,
-                                 self.pos_fwd, self.pos_side)
+                                 " (зерк.)" if ph.mirrored else "", " + прыжок" if jumped else "",
+                                 ph.dur * self._cur_tempo, self.pos_fwd, self.pos_side)
 
     def _phrase_end(self) -> float:
         return self._cur_t0 + self._cur.dur * self._cur_tempo

@@ -1,0 +1,20 @@
+        tl = getattr(self, "_list_last", None) if self._LIST_TARGETING else None
+        if tl is not None and tl.visible and tl.selected_row is not None and getattr(self, "_list_saw_selected", False):
+            return self._FAST_KILL_GRACE_S if low_hp else self._LIST_ALIVE_GRACE_S
+        if low_hp:
+            return self._FAST_KILL_GRACE_S
+        return self._TARGET_LOST_GRACE_S
+
+    def _record_hp(self, now: float, hp: float) -> None:
+        """
+        Раз в _KILL_HP_SAMPLE_EVERY_S кладёт (время, HP панели) в скользящее
+        окно. Не каждый кадр: 60 записей в секунду ничего не добавили бы к
+        оценке скорости падения, а окно на 3 с хранит ровно 30 чисел.
+        """
+        if now >= self._hp_next_sample_at:
+            self._hp_hist.append((now, hp))
+            self._hp_next_sample_at = now + self._KILL_HP_SAMPLE_EVERY_S
+
+    def _kill_verdict(self, now: float) -> "tuple[bool, float, float, float]":
+        """
+        Убита ли цель, пропавшая с панели. Возвращает

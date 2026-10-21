@@ -1,0 +1,1 @@
+def locate_list(frame: "np.ndarray | None") -> "tuple[float, float, float, float, bool] | None":

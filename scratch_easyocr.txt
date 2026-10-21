@@ -1,0 +1,18 @@
+class EasyOcr:
+    """
+    EasyOCR (pip install easyocr): своя нейросеть, от настроек Windows не зависит (2026-10-07: у
+    Windows OCR на ПК игрока "распознаватели в системе: нет", хотя пакеты ru/en стоят). Медленнее
+    (~100-200 мс на строку на CPU), но чат читается в фоне и только новые строки — хватает.
+    Первый запуск качает модели (~100 МБ) — один раз.
+    """
+
+    def __init__(self, langs: "tuple[str, ...]" = ("ru", "en")) -> None:
+        import easyocr                                                      # noqa: WPS433
+        self._r = easyocr.Reader(list(langs), gpu=False, verbose=False)
+        self.name = "EasyOCR (%s, CPU)" % "+".join(langs)
+
+    def __call__(self, img: np.ndarray) -> str:
+        # detail=0 — только текст; paragraph — склеить куски строки слева направо.
+        return " ".join(self._r.readtext(img, detail=0, paragraph=True)).strip()
+
+

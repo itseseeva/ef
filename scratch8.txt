@@ -1,0 +1,4 @@
+147: hsv — уже посчитанный HSV того же куска: его же берёт читатель текста, и
+151: hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+326: # Один HSV-проход на два чтения: длина заливки (HP в процентах) и текст HP.
+327: hsv = cv2.cvtColor(interior, cv2.COLOR_BGR2HSV)

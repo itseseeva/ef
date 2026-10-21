@@ -1,0 +1,13 @@
+{
+ "state": "COMBAT",
+ "phase": "TAB",
+ "engaged": true,
+ "since_entry_s": 15.17,
+ "chain": null,
+ "panel_found": true,
+ "hp": 16.43,
+ "txt": "None",
+ "action": "attack_click",
+ "why": "под прицелом другой моб — ПКМ выбрал бы его",
+ "event": "guard_denied"
+}

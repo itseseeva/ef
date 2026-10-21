@@ -1,0 +1,9 @@
+364: # уже <= _FAST_KILL_MAX_HP, это почти наверняка смерть — ждём не 1.5 с, а
+365: # _FAST_KILL_GRACE_S (это всё ещё больше замеренных морганий панели 0.36-0.41 с).
+372: _FAST_KILL_MAX_HP = 20.0
+373: _FAST_KILL_GRACE_S = 0.42  # ТУРБО-2 2026-10-05: было 0.45
+3820: Сколько ждать возвращения пропавшей панели (см. _FAST_KILL_*). Последний
+3830: low_hp = bool(hist) and 0.0 <= hist[-1][1] <= self._FAST_KILL_MAX_HP
+3833: return self._FAST_KILL_GRACE_S if low_hp else self._LIST_ALIVE_GRACE_S
+3834: if low_hp:
+3835: return self._FAST_KILL_GRACE_S

@@ -1,0 +1,14 @@
+{
+ "state": "SEARCH",
+ "phase": "LIST",
+ "engaged": false,
+ "since_entry_s": 0.0,
+ "chain": null,
+ "panel_found": null,
+ "hp": null,
+ "txt": null,
+ "picked": 4,
+ "list": "1:3мX 2:22м 3:16м* 4:13м! 5:24м! 6:1мX(94%) 7:35м 8:45м!",
+ "raw": "1:3мX 2:22м 3:16м* 4:13м! 5:24м! 6:1мX(94%) 7:35м 8:45м!",
+ "event": "list_pick"
+}

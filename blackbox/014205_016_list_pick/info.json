@@ -1,0 +1,14 @@
+{
+ "state": "SEARCH",
+ "phase": "LIST",
+ "engaged": false,
+ "since_entry_s": 0.31,
+ "chain": null,
+ "panel_found": true,
+ "hp": 100.0,
+ "txt": "HpText(sig=aa7b76c0, ink=188, 10x98)",
+ "picked": 4,
+ "list": "4:11м 5:28м 6:37м 7:42м",
+ "raw": "4:11м 5:28м 6:37м 7:42м",
+ "event": "list_pick"
+}

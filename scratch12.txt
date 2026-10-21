@@ -1,0 +1,2 @@
+228: last_reason = "нет пары линий на расстоянии %d px" % T.FRAME_LINE_GAP
+242: last_reason = res.reason

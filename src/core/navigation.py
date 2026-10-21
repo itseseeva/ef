@@ -11,6 +11,8 @@ src/core/navigation.py — "где я и куда идти" для подфаз�
       мобы спавнятся часто, споты разные). Прогулка кружит рядом с якорем — там, где мобы
       реально были, — а сам якорь переезжает с каждым убитым мобом;
     - ПРОГУЛКА: в списке целей пусто — случайная точка в радиусе explore_m от якоря, бежим к ней;
+    - ДОМ (2026-10-05): точка, где бота запустили. Раз в 2-3 минуты бот сам сходит туда
+      (bot.py, _HOME_EVERY_S) — чтобы за час фарма не уползти за мобами на другой конец карты;
     - КУРС: куда смотрит камера, узнаём по ДВИЖЕНИЮ на карте за последнюю секунду с
       поправкой на то, какие клавиши были зажаты (стрейф вправо = камера смотрит на 90°
       левее направления бега). Повернуть камеру на нужный угол: угол x счётчиков_на_градус;
@@ -49,7 +51,14 @@ class NavTuning:
     explore_m: float = 30.0          # точки прогулки — не дальше от якоря (место последнего убийства)
     waypoint_min_m: float = 10.0     # и не ближе к нам (иначе "прогулка" на месте)
     arrive_m: float = 4.0
-    px_per_m_guess: float = 1.5      # до первого замера масштаба (по списку целей)
+    # До первого замера масштаба. Было 1.5 — в 2.7 раза больше настоящего: замеры в прошлых логах
+    # 0.43-0.59 px/м (медиана ~0.55), и до первого замера "до дома" занижалось в ~3 раза.
+    px_per_m_guess: float = 0.55
+    # Правдоподобные замеры. Замер считает, что моб СТОИТ, а мы бежим к нему; если моб бежит навстречу
+    # (агрессивный, режим пул), сближение вдвое быстрее и замер вдвое меньше (лог 2026-10-13 07:04:04:
+    # 0.23 px/м -> "до дома 28 м" при настоящих ~12, бот бегал домой кругами). Такие отбрасываем.
+    scale_min_ok: float = 0.35
+    scale_max_ok: float = 1.2
     heading_window_s: float = 1.0    # курс — по движению за последнюю секунду
     heading_min_px: float = 2.5      # сдвинулись меньше — курс не судим
     turn_tol_deg: float = 20.0       # ошибка курса меньше — не поворачиваем (человек тоже не идеален)
@@ -69,6 +78,12 @@ class NavTuning:
     cam_ref_max_age_s: float = 90.0  # курс камеры "по счётчикам" верим столько после последнего замера
     motion_window_s: float = 1.0     # направление бега (без клавиш: персонаж бежит к цели сам)
     motion_min_px: float = 2.0       # ~3.5 м при масштабе ~0.6 px/м (замер 2026-10-04)
+    # Сверка с домом (2026-10-12): снимок миникарты на месте старта; ближе reloc_max_px к дому —
+    # раз в reloc_every_s сравниваем с ним и убираем накопленную ошибку одометра.
+    reloc_max_px: float = 45.0       # дальше снимки почти не перекрываются (40 px — уверенность 0.31)
+    reloc_every_s: float = 2.0
+    reloc_min_response: float = 0.2  # своё место 0.31-0.75, чужое 0.00-0.08
+    reloc_max_fix_px: float = 30.0   # поправка больше — скорее ложное совпадение, не берём
 
 
 class Navigator:
@@ -81,6 +96,11 @@ class Navigator:
         self._rng = rng or random.Random()
         self.anchor = (0.0, 0.0)
         self._anchor_pending = True                # якорь = первая уверенно измеренная точка
+        self.home = (0.0, 0.0)
+        self._home_pending = True                  # дом = точка запуска бота
+        self._home_snap = None                     # кадр миникарты на месте дома (для сверки)
+        self._reloc_next = 0.0
+        self.relocs = 0
         self.counts_per_deg = self.t.counts_per_deg0
         self._scale: "deque[float]" = deque(maxlen=9)
         self._approach: "tuple[float, float, float] | None" = None     # (d0, x0, y0)
@@ -110,7 +130,52 @@ class Navigator:
                 self._anchor_pending = False
                 self.anchor = self.pos
                 gamepad_debug_logger.debug("NAV     якорь прогулки — здесь (%.0f, %.0f) px карты", *self.anchor)
+            if self._home_pending:
+                self._home_pending = False
+                self.home = self.pos
+                snap = getattr(self.odo, "last_prepared", None)
+                self._home_snap = None if snap is None else snap.copy()
+                gamepad_debug_logger.debug("NAV     дом — здесь (%.0f, %.0f) px карты%s", self.home[0], self.home[1],
+                                           ", снимок карты для сверки сохранён" if snap is not None else "")
         return ok
+
+    def set_home(self) -> None:
+        """Запуск бота: дом — там, где персонаж стоит сейчас."""
+        self._home_pending = True
+
+    def dist_home_m(self) -> float:
+        x, y = self.pos
+        return math.hypot(x - self.home[0], y - self.home[1]) / self.px_per_m
+
+    def relocalize_home(self, now: float) -> "tuple[float, float, float] | None":
+        """
+        Рядом с домом (ближе reloc_max_px) не чаще раза в reloc_every_s: сверка миникарты со
+        снимком дома (MinimapOdometry.relocate). Убирает ошибку, которую одометр копит за час
+        фарма, — бот приходит точно в точку старта. None — сверка не нужна или не удалась.
+        Стоимость: одна фазовая корреляция 228x162 (~2 мс), только возле дома.
+        """
+        if self._home_snap is None or now < self._reloc_next or not getattr(self.odo, "ok", False):
+            return None
+        x, y = self.pos
+        if math.hypot(x - self.home[0], y - self.home[1]) > self.t.reloc_max_px:
+            return None
+        self._reloc_next = now + self.t.reloc_every_s
+        relocate = getattr(self.odo, "relocate", None)
+        if relocate is None:
+            return None
+        before = self.pos
+        r = relocate(self._home_snap, self.home, self.t.reloc_min_response)
+        if r is None:
+            return None
+        if math.hypot(r[0], r[1]) > self.t.reloc_max_fix_px:
+            self.odo.pos[0], self.odo.pos[1] = before          # слишком большая поправка — не верим, откат
+            return None
+        self.relocs += 1
+        return r
+
+    def go_home(self) -> "tuple[float, float]":
+        self.waypoint = self.home
+        return self.home
 
     def set_anchor(self) -> None:
         """Убили моба / запустили бота: прогулка дальше кружит вокруг этого места."""
@@ -154,7 +219,7 @@ class Navigator:
         if d0 - d_m >= self.t.scale_min_m:
             px = math.hypot(x - x0, y - y0)
             ratio = px / (d0 - d_m)
-            if 0.2 <= ratio <= 20.0:
+            if self.t.scale_min_ok <= ratio <= self.t.scale_max_ok:
                 self._scale.append(ratio)
                 gamepad_debug_logger.debug("NAV     масштаб карты: %.2f px/м (замер %.2f, %d замеров)",
                                            self.px_per_m, ratio, len(self._scale))
@@ -323,6 +388,6 @@ class Navigator:
 
     def summary(self) -> str:
         x, y = self.pos
-        return "позиция (%.0f, %.0f) px, до якоря %.0f м, масштаб %.2f px/м%s, %.1f сч/°, курс %s" % (
-            x, y, self.dist_anchor_m(), self.px_per_m, "" if self.scale_known else " (оценка)",
+        return "позиция (%.0f, %.0f) px, до якоря %.0f м, до дома %.0f м, масштаб %.2f px/м%s, %.1f сч/°, курс %s" % (
+            x, y, self.dist_anchor_m(), self.dist_home_m(), self.px_per_m, "" if self.scale_known else " (оценка)",
             self.counts_per_deg, "?" if self.heading is None else "%.0f°" % self.heading)

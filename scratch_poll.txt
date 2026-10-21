@@ -1,0 +1,15 @@
+def poll(self, frame: np.ndarray) -> "list[ChatMessage]":
+        now = self._clock()
+        purple, light, time_ = color_masks(frame)
+        sig = np.packbits((purple | light)[::2, ::2]).tobytes()
+        if sig == self._last_sig:
+            msgs = self._last_msgs                # картинка та же — те же сообщения, OCR не зовём
+        else:
+            self._last_sig = sig
+            lines = segment_lines(frame, self._scale)
+            msgs = parse([(ln.channel, self._ocr(ln.image), ln.y0, ln.y1, ln.header) for ln in lines],
+                         int(round(MERGE_GAP * self._scale)))
+            self._last_msgs = msgs
+        return self.update(msgs, sig, now)
+
+    def

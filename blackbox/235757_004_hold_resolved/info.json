@@ -1,0 +1,14 @@
+{
+ "state": "COMBAT",
+ "phase": "LIST",
+ "engaged": true,
+ "since_entry_s": 20.77,
+ "chain": "Цепочка #4",
+ "panel_found": true,
+ "hp": 100.0,
+ "txt": "HpText(sig=b124a710, ink=189, 10x98)",
+ "gap_s": 0.8910000000614673,
+ "hp_before": 100.0,
+ "hp_after": 100.0,
+ "event": "hold_resolved"
+}

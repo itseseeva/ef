@@ -1,0 +1,10 @@
+class ChatLine:
+    y0: int
+    y1: int
+    channel: str              # WHISPER / NORMAL — по цвету текста (у заголовка — по значку)
+    image: np.ndarray         # подготовленная для OCR полоса (тёмный текст на белом)
+    header: bool = False      # строка с ником: слева значок канала
+
+
+@dataclass(frozen=True)
+class ChatMessage:
